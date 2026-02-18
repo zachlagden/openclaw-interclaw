@@ -241,30 +241,25 @@ CONFIGEOF
 [accounts.default]
 email = "${opt_email}"
 display-name = "${opt_agent_id}"
-folder.alias.inbox = "INBOX"
-folder.alias.sent = "Sent"
 
-[accounts.default.message.send]
-backend = "smtp"
+folder.aliases.inbox = "INBOX"
+folder.aliases.sent = "Sent"
 
-[accounts.default.message.send.smtp]
-host = "${opt_smtp_host}"
-port = ${opt_smtp_port}
-encryption = "${smtp_encryption}"
-login = "${opt_smtp_user}"
-auth.type = "password"
-auth.raw = "${opt_smtp_pass}"
+backend.type = "imap"
+backend.host = "${opt_imap_host}"
+backend.port = ${opt_imap_port}
+backend.encryption.type = "${imap_encryption}"
+backend.login = "${opt_imap_user}"
+backend.auth.type = "password"
+backend.auth.raw = "${opt_imap_pass}"
 
-[accounts.default.backend]
-type = "imap"
-
-[accounts.default.backend.imap]
-host = "${opt_imap_host}"
-port = ${opt_imap_port}
-encryption = "${imap_encryption}"
-login = "${opt_imap_user}"
-auth.type = "password"
-auth.raw = "${opt_imap_pass}"
+message.send.backend.type = "smtp"
+message.send.backend.host = "${opt_smtp_host}"
+message.send.backend.port = ${opt_smtp_port}
+message.send.backend.encryption.type = "${smtp_encryption}"
+message.send.backend.login = "${opt_smtp_user}"
+message.send.backend.auth.type = "password"
+message.send.backend.auth.raw = "${opt_smtp_pass}"
 TOMLEOF
     chmod 600 "$himalaya_toml"
 

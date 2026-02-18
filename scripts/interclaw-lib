@@ -202,15 +202,17 @@ generate_ulid() {
 # Returns the next GlobalSeq and increments the counter atomically.
 # Uses flock to prevent TOCTOU races between concurrent processes.
 next_global_seq() {
+    local lock_file="${INTERCLAW_GLOBAL_SEQ_FILE}.lock"
     local next
     next=$(
+        exec 200>"$lock_file"
         flock -x 200
         local current
         current=$(cat "${INTERCLAW_GLOBAL_SEQ_FILE}" 2>/dev/null || echo "0")
         local n=$(( current + 1 ))
         echo "${n}" > "${INTERCLAW_GLOBAL_SEQ_FILE}"
         echo "${n}"
-    ) 200>"${INTERCLAW_GLOBAL_SEQ_FILE}.lock"
+    )
     printf "D-%03d" "${next}"
 }
 
@@ -258,15 +260,17 @@ next_conv_seq() {
     fi
 
     local seq_file="${conv_dir}/conv_seq"
+    local lock_file="${seq_file}.lock"
     local next
     next=$(
+        exec 200>"$lock_file"
         flock -x 200
         local current
         current=$(cat "${seq_file}" 2>/dev/null || echo "0")
         local n=$(( current + 1 ))
         echo "${n}" > "${seq_file}"
         echo "${n}"
-    ) 200>"${seq_file}.lock"
+    )
 
     # Update last_activity
     local ts; ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -865,8 +869,10 @@ check_rate_limit() {
     local limit="${2:-60}"
     local window_file="${INTERCLAW_STATE_DIR}/.ratelimit_${sender//[^a-zA-Z0-9]/_}"
 
+    local lock_file="${window_file}.lock"
     local result
     result=$(
+        exec 200>"$lock_file"
         flock -x 200
 
         local now; now=$(date +%s)
@@ -895,7 +901,7 @@ check_rate_limit() {
             printf '%s' "$new_content" > "$window_file"
             echo "OK"
         fi
-    ) 200>"${window_file}.lock"
+    )
 
     if [[ "$result" == "REJECTED" ]]; then
         log WARN "Rate limit exceeded for ${sender}: limit=${limit} per hour"
