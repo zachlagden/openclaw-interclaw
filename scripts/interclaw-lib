@@ -702,28 +702,31 @@ sanitize_body() {
 }
 
 # ── Himalaya Helpers ──────────────────────────────────────────────
+# These use the himalaya v1.1.0 CLI subcommand structure.
 himalaya_send() {
     local to="$1"
     local subject="$2"
     local body="$3"
 
-    echo "$body" | himalaya send --to "$to" --subject "$subject" 2>&1
+    # himalaya message send expects a raw RFC 822 message on stdin
+    printf 'To: %s\r\nSubject: %s\r\n\r\n%s' "$to" "$subject" "$body" \
+        | himalaya message send 2>&1
 }
 
 himalaya_list_new() {
-    # List unread messages, return JSON-like output
-    himalaya list --folder INBOX --query "unseen" 2>/dev/null || true
+    # List unread envelopes in INBOX
+    himalaya envelope list --folder INBOX "not seen" 2>/dev/null || true
 }
 
 himalaya_read() {
     local msg_id="$1"
-    himalaya read --plain "$msg_id" 2>/dev/null
+    himalaya message read --preview "$msg_id" 2>/dev/null
 }
 
 himalaya_move() {
     local msg_id="$1"
     local folder="$2"
-    himalaya move "$msg_id" "$folder" 2>/dev/null || true
+    himalaya message move "$folder" "$msg_id" 2>/dev/null || true
 }
 
 # ── Threads JSON Generation ──────────────────────────────────────

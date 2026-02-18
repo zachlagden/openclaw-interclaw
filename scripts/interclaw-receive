@@ -602,10 +602,10 @@ poll_once() {
         acct_flag="--account ${HIMALAYA_ACCOUNT}"
     fi
 
-    # List unread messages
+    # List unread envelopes
     local msg_list
     # shellcheck disable=SC2086
-    msg_list=$(himalaya $acct_flag list --folder INBOX --query "unseen" 2>/dev/null) || {
+    msg_list=$(himalaya $acct_flag envelope list --folder INBOX "not seen" 2>/dev/null) || {
         log WARN "Failed to list messages from IMAP"
         return 1
     }
@@ -640,11 +640,11 @@ poll_once() {
         # Download raw message for proper parsing
         local raw_msg
         # shellcheck disable=SC2086
-        raw_msg=$(himalaya $acct_flag read --raw "$msg_id" 2>/dev/null) || {
-            # Fallback: try plain text read if --raw not supported
+        raw_msg=$(himalaya $acct_flag message export "$msg_id" 2>/dev/null) || {
+            # Fallback: try human-readable read if export not supported
             # shellcheck disable=SC2086
             local plain_body
-            plain_body=$(himalaya $acct_flag read --plain "$msg_id" 2>/dev/null) || {
+            plain_body=$(himalaya $acct_flag message read --preview "$msg_id" 2>/dev/null) || {
                 log WARN "Failed to read message ${msg_id}"
                 continue
             }
@@ -658,10 +658,10 @@ ${plain_body}"
         # Process through the unified pipeline
         if process_raw_email "$raw_msg" "himalaya:${msg_id}"; then
             # shellcheck disable=SC2086
-            himalaya $acct_flag move "$msg_id" "InterClaw/Processed" 2>/dev/null || true
+            himalaya $acct_flag message move "InterClaw/Processed" "$msg_id" 2>/dev/null || true
         else
             # shellcheck disable=SC2086
-            himalaya $acct_flag move "$msg_id" "InterClaw/Failed" 2>/dev/null || true
+            himalaya $acct_flag message move "InterClaw/Failed" "$msg_id" 2>/dev/null || true
         fi
 
     done <<< "$msg_list"
