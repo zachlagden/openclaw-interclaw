@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# interclaw-setup-polling — Optional convenience poller for a dedicated
+# InterClaw inbox.
+#
+# This script sets up a systemd user service or cron job that runs
+# interclaw-receive --poll in the background.
+#
+# IMPORTANT: This is a convenience helper for beginners using a dedicated
+# InterClaw email account. Advanced users should use their own pipeline
+# (fetchmail, getmail, procmail, custom MDA) and pipe messages into
+# interclaw-receive --stdin instead. The --stdin mode gives you full
+# control over mail retrieval and is the recommended production setup.
+#
+# Usage:
+#   interclaw-setup-polling --cron            # Add a cron job
+#   interclaw-setup-polling --systemd         # Create a systemd user service
+#   interclaw-setup-polling --remove          # Remove cron/systemd setup
+#   interclaw-setup-polling --status          # Check if polling is active
+#
+# Flags:
+#   --cron        Set up a cron job (runs --once every N minutes)
+#   --systemd     Set up a systemd user service (runs --poll)
+#   --interval N  Poll interval in minutes (default: from config or 5)
+#   --account X   Himalaya account name (optional)
+#   --remove      Remove all polling setup
+#   --status      Check current polling status
+
+set -euo pipefail
+
+# ── Resolve script directory and source library ───────────────────
+_self="${BASH_SOURCE[0]}"
+if command -v readlink &>/dev/null; then
+    _self="$(readlink -f "$_self" 2>/dev/null || readlink "$_self" 2>/dev/null || echo "$_self")"
+fi
+SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
+unset _self
+# shellcheck source=interclaw-lib
+source "${SCRIPT_DIR}/interclaw-lib"
+
+# ── Parse Arguments ───────────────────────────────────────────────
+SETUP_MODE=""
+INTERVAL=""
+ACCOUNT=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --cron)      SETUP_MODE="cron"; shift ;;
+        --systemd)   SETUP_MODE="systemd"; shift ;;
+        --remove)    SETUP_MODE="remove"; shift ;;
+        --status)    SETUP_MODE="status"; shift ;;
+        --interval)  INTERVAL="$2"; shift 2 ;;
+        --account)   ACCOUNT="$2"; shift 2 ;;
+        --verbose)   export INTERCLAW_VERBOSE=true; shift ;;
+        -h|--help)
+            echo "interclaw-setup-polling — Optional convenience poller"
+            echo ""
+            echo "  This sets up automatic IMAP polling for a dedicated InterClaw inbox."
+            echo "  For production, consider using your own mail pipeline + --stdin instead."
+            echo ""
+            echo "Usage:"
+            echo "  interclaw-setup-polling --cron              Add a cron job"
+            echo "  interclaw-setup-polling --systemd           Create systemd user service"
+            echo "  interclaw-setup-polling --remove            Remove all polling setup"
+            echo "  interclaw-setup-polling --status            Check polling status"
+            echo ""
+            echo "Options:"
+            echo "  --interval N    Poll interval in minutes (default: 5)"
+            echo "  --account X     Himalaya account name"
+            echo ""
+            echo "NOTE: Advanced users should use their own pipeline + --stdin mode."
+            echo "This helper is recommended for beginners with a dedicated InterClaw inbox."
+            exit 0
+            ;;
+        *)
+            die "Unknown argument: $1"
+            ;;
+    esac
+done
+
+[[ -z "$SETUP_MODE" ]] && die "Specify --cron, --systemd, --remove, or --status"
+
+# ── Initialize ────────────────────────────────────────────────────
+ensure_dirs
+
+if [[ -f "${INTERCLAW_CONFIG}" ]]; then
+    load_config 2>/dev/null || true
+fi
+
+INTERVAL="${INTERVAL:-${INTERCLAW_POLL_INTERVAL:-5}}"
+
+# Resolve interclaw-receive path
+RECEIVE_BIN=$(command -v interclaw-receive 2>/dev/null || echo "${SCRIPT_DIR}/interclaw-receive")
+
+ACCOUNT_FLAG=""
+if [[ -n "$ACCOUNT" ]]; then
+    ACCOUNT_FLAG="--account ${ACCOUNT}"
+fi
+
+readonly CRON_MARKER="# interclaw-polling"
+readonly SERVICE_NAME="interclaw-polling"
+
+# ── Status ────────────────────────────────────────────────────────
+
+cmd_status() {
+    echo "InterClaw Polling Status"
+    echo "══════════════════════════════════════════"
+    echo ""
+
+    # Check cron
+    local cron_active=false
+    if crontab -l 2>/dev/null | grep -q "${CRON_MARKER}"; then
+        cron_active=true
+        local cron_line
+        cron_line=$(crontab -l 2>/dev/null | grep "${CRON_MARKER}")
+        echo "  Cron:    ACTIVE"
+        echo "           ${cron_line}"
+    else
+        echo "  Cron:    not configured"
+    fi
+
+    # Check systemd
+    local systemd_active=false
+    if systemctl --user is-active "${SERVICE_NAME}" &>/dev/null; then
+        systemd_active=true
+        echo "  Systemd: ACTIVE"
+        systemctl --user status "${SERVICE_NAME}" --no-pager 2>/dev/null | head -5 | sed 's/^/           /'
+    elif systemctl --user is-enabled "${SERVICE_NAME}" &>/dev/null; then
+        echo "  Systemd: enabled but not running"
+    else
+        echo "  Systemd: not configured"
+    fi
+
+    # Check for running process
+    if pgrep -f "interclaw-receive --poll" &>/dev/null; then
+        echo "  Process: running (PID $(pgrep -f "interclaw-receive --poll" | head -1))"
+    else
+        echo "  Process: not running"
+    fi
+
+    echo ""
+
+    if ! $cron_active && ! $systemd_active; then
+        echo "  No automatic polling configured."
+        echo "  Run: interclaw-setup-polling --cron"
+        echo "  Or:  interclaw-setup-polling --systemd"
+        echo ""
+        echo "  For advanced setups, pipe mail directly:"
+        echo "    your-mail-fetcher | interclaw-receive --stdin"
+    fi
+    echo ""
+}
+
+# ── Cron Setup ────────────────────────────────────────────────────
+
+cmd_cron() {
+    echo "Setting up cron polling (every ${INTERVAL} minutes)..."
+
+    local cron_cmd="*/${INTERVAL} * * * * ${RECEIVE_BIN} --once ${ACCOUNT_FLAG} >> ${INTERCLAW_LOG_DIR}/cron.log 2>&1 ${CRON_MARKER}"
+
+    # Remove existing InterClaw cron entries, then add new one
+    local existing
+    existing=$(crontab -l 2>/dev/null || true)
+    local filtered
+    filtered=$(echo "$existing" | grep -v "${CRON_MARKER}" || true)
+
+    echo "${filtered}
+${cron_cmd}" | crontab -
+
+    echo ""
+    echo "Cron job installed:"
+    echo "  ${cron_cmd}"
+    echo ""
+    echo "Verify with: crontab -l | grep interclaw"
+    echo "Remove with: interclaw-setup-polling --remove"
+    echo ""
+    echo "NOTE: For production deployments, consider using your own mail"
+    echo "pipeline and piping to interclaw-receive --stdin instead."
+}
+
+# ── Systemd Setup ─────────────────────────────────────────────────
+
+cmd_systemd() {
+    echo "Setting up systemd user service..."
+
+    local service_dir="${HOME}/.config/systemd/user"
+    mkdir -p "$service_dir"
+
+    cat > "${service_dir}/${SERVICE_NAME}.service" <<EOF
+[Unit]
+Description=InterClaw Email Polling Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${RECEIVE_BIN} --poll ${ACCOUNT_FLAG}
+Restart=on-failure
+RestartSec=30
+Environment=HOME=${HOME}
+
+[Install]
+WantedBy=default.target
+EOF
+
+    systemctl --user daemon-reload
+    systemctl --user enable "${SERVICE_NAME}"
+    systemctl --user start "${SERVICE_NAME}"
+
+    echo ""
+    echo "Systemd service installed and started."
+    echo ""
+    echo "  Status:  systemctl --user status ${SERVICE_NAME}"
+    echo "  Logs:    journalctl --user -u ${SERVICE_NAME} -f"
+    echo "  Stop:    systemctl --user stop ${SERVICE_NAME}"
+    echo "  Remove:  interclaw-setup-polling --remove"
+    echo ""
+    echo "NOTE: For production deployments, consider using your own mail"
+    echo "pipeline and piping to interclaw-receive --stdin instead."
+}
+
+# ── Remove ────────────────────────────────────────────────────────
+
+cmd_remove() {
+    echo "Removing InterClaw polling setup..."
+    echo ""
+
+    # Remove cron
+    if crontab -l 2>/dev/null | grep -q "${CRON_MARKER}"; then
+        local existing
+        existing=$(crontab -l 2>/dev/null)
+        echo "$existing" | grep -v "${CRON_MARKER}" | crontab -
+        echo "  Cron job removed."
+    else
+        echo "  No cron job found."
+    fi
+
+    # Remove systemd
+    local service_file="${HOME}/.config/systemd/user/${SERVICE_NAME}.service"
+    if [[ -f "$service_file" ]]; then
+        systemctl --user stop "${SERVICE_NAME}" 2>/dev/null || true
+        systemctl --user disable "${SERVICE_NAME}" 2>/dev/null || true
+        rm -f "$service_file"
+        systemctl --user daemon-reload 2>/dev/null || true
+        echo "  Systemd service removed."
+    else
+        echo "  No systemd service found."
+    fi
+
+    echo ""
+    echo "Done. Polling removed."
+}
+
+# ── Dispatch ──────────────────────────────────────────────────────
+case "$SETUP_MODE" in
+    cron)    cmd_cron ;;
+    systemd) cmd_systemd ;;
+    remove)  cmd_remove ;;
+    status)  cmd_status ;;
+esac

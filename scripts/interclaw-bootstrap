@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# interclaw-bootstrap — Install dependencies and symlink InterClaw scripts.
+#
+# This script does NOT source interclaw-lib because dependencies may not
+# be installed yet. It is safe to run before gpg or himalaya exist.
+#
+# Usage:
+#   interclaw-bootstrap                   # Full bootstrap
+#   interclaw-bootstrap --skip-deps       # Skip dependency installation
+#   interclaw-bootstrap --skip-symlinks   # Skip script symlinking
+#   interclaw-bootstrap -h|--help         # Show help
+
+set -euo pipefail
+
+_self="${BASH_SOURCE[0]}"
+if command -v readlink &>/dev/null; then
+    _self="$(readlink -f "$_self" 2>/dev/null || readlink "$_self" 2>/dev/null || echo "$_self")"
+fi
+SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
+unset _self
+
+# ── Usage ─────────────────────────────────────────────────────────
+usage() {
+    cat <<EOF
+Usage: interclaw-bootstrap [OPTIONS]
+
+Install InterClaw dependencies and symlink scripts to PATH.
+
+Options:
+  --skip-deps       Skip dependency installation (gpg, himalaya)
+  --skip-symlinks   Skip symlinking scripts to ~/.local/bin
+  -h, --help        Show this help message
+
+This script is idempotent — running it multiple times is safe.
+EOF
+    exit 0
+}
+
+# ── Parse flags ───────────────────────────────────────────────────
+SKIP_DEPS=false
+SKIP_SYMLINKS=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --skip-deps)     SKIP_DEPS=true; shift ;;
+        --skip-symlinks) SKIP_SYMLINKS=true; shift ;;
+        -h|--help)       usage ;;
+        *)               echo "Unknown option: $1"; usage ;;
+    esac
+done
+
+# ── Platform detection ────────────────────────────────────────────
+detect_platform() {
+    OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+    ARCH="$(uname -m)"
+
+    case "$OS" in
+        linux)  OS="linux" ;;
+        darwin) OS="darwin" ;;
+        *)      echo "Unsupported OS: $OS"; exit 1 ;;
+    esac
+
+    case "$ARCH" in
+        x86_64|amd64)   ARCH="x86_64" ;;
+        aarch64|arm64)  ARCH="aarch64" ;;
+        *)              echo "Unsupported architecture: $ARCH"; exit 1 ;;
+    esac
+
+    echo "Platform: ${OS}/${ARCH}"
+}
+
+# ── Dependency installation ───────────────────────────────────────
+install_gpg() {
+    if command -v gpg &>/dev/null; then
+        echo "gpg: already installed ($(gpg --version 2>/dev/null | head -1))"
+        return 0
+    fi
+
+    echo "gpg: not found, installing..."
+
+    case "$OS" in
+        linux)
+            if command -v sudo &>/dev/null; then
+                sudo apt-get update -qq && sudo apt-get install -y gnupg
+            else
+                echo "gpg: sudo not available. Install gnupg manually:"
+                echo "  apt-get install gnupg"
+                return 1
+            fi
+            ;;
+        darwin)
+            if command -v brew &>/dev/null; then
+                brew install gnupg
+            else
+                echo "gpg: Homebrew not available. Install gnupg manually:"
+                echo "  brew install gnupg"
+                echo "  Or: https://gnupg.org/download/"
+                return 1
+            fi
+            ;;
+    esac
+
+    if command -v gpg &>/dev/null; then
+        echo "gpg: installed successfully ($(gpg --version 2>/dev/null | head -1))"
+    else
+        echo "gpg: installation failed"
+        return 1
+    fi
+}
+
+install_himalaya() {
+    if command -v himalaya &>/dev/null; then
+        echo "himalaya: already installed ($(himalaya --version 2>/dev/null | head -1))"
+        return 0
+    fi
+
+    echo "himalaya: not found, installing..."
+
+    local target="${ARCH}-${OS}"
+    local url="https://github.com/pimalaya/himalaya/releases/latest/download/himalaya.${target}.tgz"
+    local install_dir="${HOME}/.local/bin"
+
+    mkdir -p "$install_dir"
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    trap "rm -rf '$tmpdir'" RETURN
+
+    echo "himalaya: downloading from ${url}"
+    if ! curl -fsSL "$url" -o "${tmpdir}/himalaya.tgz"; then
+        echo "himalaya: download failed. Install manually:"
+        echo "  ${url}"
+        echo "  Or: cargo install himalaya"
+        return 1
+    fi
+
+    if ! tar -xzf "${tmpdir}/himalaya.tgz" -C "$tmpdir"; then
+        echo "himalaya: extraction failed"
+        return 1
+    fi
+
+    # The binary may be at the top level or in a subdirectory
+    local binary
+    binary=$(find "$tmpdir" -name "himalaya" -type f ! -name "*.tgz" | head -1)
+    if [[ -z "$binary" ]]; then
+        echo "himalaya: binary not found in archive"
+        return 1
+    fi
+
+    cp "$binary" "${install_dir}/himalaya"
+    chmod +x "${install_dir}/himalaya"
+
+    if "${install_dir}/himalaya" --version &>/dev/null; then
+        echo "himalaya: installed to ${install_dir}/himalaya ($("${install_dir}/himalaya" --version 2>/dev/null | head -1))"
+    else
+        echo "himalaya: installed to ${install_dir}/himalaya (version check failed, but binary exists)"
+    fi
+}
+
+# ── Script symlinking ─────────────────────────────────────────────
+symlink_scripts() {
+    local bin_dir="${HOME}/.local/bin"
+    mkdir -p "$bin_dir"
+
+    local count=0
+    for script in "${SCRIPT_DIR}"/interclaw-*; do
+        [[ -f "$script" ]] || continue
+        local name
+        name=$(basename "$script")
+
+        # Skip interclaw-lib — other scripts find it via BASH_SOURCE resolution
+        [[ "$name" == "interclaw-lib" ]] && continue
+
+        ln -sf "$script" "${bin_dir}/${name}"
+        count=$(( count + 1 ))
+    done
+
+    echo "Symlinked ${count} scripts to ${bin_dir}/"
+}
+
+# ── PATH management ───────────────────────────────────────────────
+ensure_path() {
+    local bin_dir="${HOME}/.local/bin"
+
+    # Check if already in PATH
+    if echo "$PATH" | tr ':' '\n' | grep -qx "$bin_dir"; then
+        echo "PATH: ${bin_dir} already in PATH"
+        return 0
+    fi
+
+    local export_line='export PATH="${HOME}/.local/bin:${PATH}"'
+
+    # Append to shell rc files
+    if [[ -f "${HOME}/.bashrc" ]]; then
+        if ! grep -qF '.local/bin' "${HOME}/.bashrc"; then
+            echo "" >> "${HOME}/.bashrc"
+            echo "# Added by interclaw-bootstrap" >> "${HOME}/.bashrc"
+            echo "$export_line" >> "${HOME}/.bashrc"
+            echo "PATH: added to ~/.bashrc"
+        fi
+    fi
+
+    if [[ -f "${HOME}/.zshrc" ]]; then
+        if ! grep -qF '.local/bin' "${HOME}/.zshrc"; then
+            echo "" >> "${HOME}/.zshrc"
+            echo "# Added by interclaw-bootstrap" >> "${HOME}/.zshrc"
+            echo "$export_line" >> "${HOME}/.zshrc"
+            echo "PATH: added to ~/.zshrc"
+        fi
+    fi
+
+    # Export for current session
+    export PATH="${bin_dir}:${PATH}"
+    echo "PATH: exported for current session"
+}
+
+# ── Main ──────────────────────────────────────────────────────────
+echo "InterClaw Bootstrap"
+echo "==================="
+echo ""
+
+detect_platform
+echo ""
+
+if [[ "$SKIP_DEPS" != "true" ]]; then
+    echo "--- Dependencies ---"
+    install_gpg || true
+    install_himalaya || true
+    echo ""
+fi
+
+if [[ "$SKIP_SYMLINKS" != "true" ]]; then
+    echo "--- Script Symlinks ---"
+    symlink_scripts
+    ensure_path
+    echo ""
+fi
+
+echo "--- Done ---"
+echo "Next: interclaw-config init --email you@example.com --smtp-host smtp.example.com --smtp-pass 'app-password'"

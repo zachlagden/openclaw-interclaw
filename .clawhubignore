@@ -1,0 +1,38 @@
+# Secrets and credentials
+.env
+.env.*
+*.key
+*.pem
+secrets/
+credentials/
+
+# State (user-specific)
+state/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Editor artifacts
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Build artifacts
+dist/
+build/
+target/
+
+# Dependencies
+node_modules/
+
+# Logs
+*.log
+logs/
+
+# GPG exports (never publish)
+*.gpg
+*.asc
+!docs/*.asc

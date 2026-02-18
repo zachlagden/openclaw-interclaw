@@ -1,0 +1,715 @@
+#!/usr/bin/env bash
+# interclaw-receive — Process incoming InterClaw messages from any source.
+#
+# InterClaw is a protocol + security layer, NOT a mail client. This script
+# accepts messages from any inbound pipeline and applies the full InterClaw
+# processing stack: filtering, PGP verification, sequencing, gap detection,
+# tag routing, and auto-ACK.
+#
+# THREE INPUT MODES:
+#   --poll [--account <name>]    Use himalaya to fetch unread messages
+#   --file <path>                Process a single .eml or plain text file
+#   --stdin                      Read a raw email from stdin
+#
+# The --stdin mode is the recommended integration point. Your existing
+# cron, fetchmail, getmail, procmail, or MDA can simply pipe messages in:
+#   fetchmail | interclaw-receive --stdin
+#   cat /var/mail/new/msg.eml | interclaw-receive --stdin
+#
+# STRICT FILTERING: Only InterClaw messages are processed. A message must
+# have an X-Agent-ID email header, OR a subject starting with a valid
+# InterClaw tag (e.g. [COORD], [ENCRYPTED]), OR InterClaw protocol
+# headers in its body. Non-InterClaw mail is silently skipped.
+#
+# Flags:
+#   --poll             Continuous polling via himalaya
+#   --once             Single himalaya poll then exit
+#   --account <name>   Himalaya account name (for --poll/--once)
+#   --file <path>      Process a single raw email file
+#   --stdin            Read raw email from stdin
+#   --verbose          Debug output
+
+set -euo pipefail
+
+# ── Resolve script directory and source library ───────────────────
+_self="${BASH_SOURCE[0]}"
+if command -v readlink &>/dev/null; then
+    _self="$(readlink -f "$_self" 2>/dev/null || readlink "$_self" 2>/dev/null || echo "$_self")"
+fi
+SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
+unset _self
+# shellcheck source=interclaw-lib
+source "${SCRIPT_DIR}/interclaw-lib"
+
+# ── Parse Arguments ───────────────────────────────────────────────
+MODE=""
+PROCESS_FILE=""
+HIMALAYA_ACCOUNT=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --poll)      MODE="poll"; shift ;;
+        --once)      MODE="once"; shift ;;
+        --account)   HIMALAYA_ACCOUNT="$2"; shift 2 ;;
+        --file)      MODE="file"; PROCESS_FILE="$2"; shift 2 ;;
+        --stdin)     MODE="stdin"; shift ;;
+        --verbose)   export INTERCLAW_VERBOSE=true; shift ;;
+        -h|--help)
+            echo "Usage: interclaw-receive [--poll|--once|--file <path>|--stdin]"
+            echo ""
+            echo "Input modes:"
+            echo "  --poll             Continuous polling via himalaya (convenience)"
+            echo "  --once             Single himalaya poll then exit (for cron)"
+            echo "  --account <name>   Himalaya account to poll (optional)"
+            echo "  --file <path>      Process a single .eml or text file"
+            echo "  --stdin            Read raw email from stdin (recommended for pipelines)"
+            echo ""
+            echo "Options:"
+            echo "  --verbose          Debug output"
+            echo ""
+            echo "Pipeline examples:"
+            echo "  fetchmail | interclaw-receive --stdin"
+            echo "  cat message.eml | interclaw-receive --stdin"
+            echo "  interclaw-receive --file /var/mail/new/001.eml"
+            echo ""
+            echo "InterClaw is a protocol layer — use whichever mail transport you prefer."
+            echo "The built-in poller (--poll) is a convenience for simple setups."
+            exit 0
+            ;;
+        *)
+            die "Unknown argument: $1"
+            ;;
+    esac
+done
+
+[[ -z "$MODE" ]] && die "Specify --poll, --once, --file <path>, or --stdin"
+
+# ── Initialize ────────────────────────────────────────────────────
+ensure_dirs
+
+# IMAP config only required for poll/once modes; stdin/file don't need it
+if [[ "$MODE" == "poll" ]] || [[ "$MODE" == "once" ]]; then
+    load_config --require-imap
+else
+    load_config
+fi
+
+POLL_INTERVAL="${INTERCLAW_POLL_INTERVAL:-5}"
+AUTO_ACK="${INTERCLAW_AUTO_ACK:-true}"
+
+# ── PGP Extraction Helpers ────────────────────────────────────────
+
+extract_signed_content() {
+    local raw="$1"
+    echo "$raw" | sed -n '/-----BEGIN PGP SIGNED MESSAGE-----/,/-----END PGP SIGNATURE-----/p'
+}
+
+extract_encrypted_content() {
+    local raw="$1"
+    echo "$raw" | sed -n '/-----BEGIN PGP MESSAGE-----/,/-----END PGP MESSAGE-----/p'
+}
+
+# Extract cleartext body from a PGP clearsigned message.
+# Handles multiple Hash: headers per RFC 4880 section 7.
+# Format: BEGIN PGP SIGNED MESSAGE / Hash headers / blank line / cleartext / BEGIN PGP SIGNATURE
+extract_cleartext() {
+    local signed="$1"
+    echo "$signed" | awk '
+        /^-----BEGIN PGP SIGNATURE-----/ { exit }
+        in_body { print; next }
+        in_headers && /^[[:space:]]*$/ { in_body=1; next }
+        /^-----BEGIN PGP SIGNED MESSAGE-----/ { in_headers=1; next }
+    '
+}
+
+# ── Subject Parsing ───────────────────────────────────────────────
+
+parse_subject() {
+    local subject="$1"
+    SUBJECT_TAG=""
+    SUBJECT_TOPIC=""
+    SUBJECT_DESC=""
+
+    if [[ "$subject" =~ ^\[([A-Z]+)\] ]]; then
+        SUBJECT_TAG="${BASH_REMATCH[1]}"
+    fi
+
+    if [[ "$subject" =~ \#([a-zA-Z0-9_-]+) ]]; then
+        SUBJECT_TOPIC="${BASH_REMATCH[1]}"
+    fi
+
+    SUBJECT_DESC=$(echo "$subject" | sed 's/^\[[A-Z]*\][[:space:]]*//' | sed 's/[[:space:]]*#[a-zA-Z0-9_-]*$//' | sed 's/[[:space:]]*$//')
+}
+
+# ── Core Message Processing ───────────────────────────────────────
+# This is the unified processing pipeline that all three input modes
+# converge on. Accepts: msg_id, from, subject, raw_body (email body).
+
+process_message() {
+    local msg_id="$1"
+    local from="$2"
+    local subject="$3"
+    local raw_body="$4"
+
+    log INFO "Processing message ${msg_id} from ${from}: ${subject}"
+
+    # ── Rate limit check ──────────────────────────────────────────
+    if ! check_rate_limit "$from"; then
+        log WARN "Rate limited: dropping message from ${from}"
+        return 1
+    fi
+
+    # ── Parse subject ─────────────────────────────────────────────
+    parse_subject "$subject"
+
+    if [[ -z "$SUBJECT_TAG" ]]; then
+        log WARN "No tag found in subject, skipping: ${subject}"
+        return 1
+    fi
+
+    if ! validate_tag "$SUBJECT_TAG"; then
+        log WARN "Invalid tag [${SUBJECT_TAG}], skipping"
+        return 1
+    fi
+
+    # ── Decrypt if encrypted ──────────────────────────────────────
+    local encrypted_block
+    encrypted_block=$(extract_encrypted_content "$raw_body")
+    local was_encrypted=false
+    local sender_fingerprint=""
+
+    if [[ -n "$encrypted_block" ]]; then
+        was_encrypted=true
+        log INFO "Decrypting encrypted message"
+        local decrypted_body
+        decrypted_body=$(pgp_decrypt "$encrypted_block") || {
+            log ERROR "Failed to decrypt message from ${from}"
+            return 1
+        }
+
+        # For signed+encrypted messages, gpg verifies the embedded
+        # signature during decryption. DECRYPT_SIG_FINGERPRINT is set
+        # by pgp_decrypt from the gpg status output.
+        if [[ -n "$DECRYPT_SIG_FINGERPRINT" ]]; then
+            if ! is_trusted_fingerprint "$DECRYPT_SIG_FINGERPRINT"; then
+                log ERROR "Encrypted message signed by untrusted fingerprint ${DECRYPT_SIG_FINGERPRINT} — DROPPING"
+                return 1
+            fi
+            sender_fingerprint="$DECRYPT_SIG_FINGERPRINT"
+            log INFO "Verified embedded signature (fingerprint: ${sender_fingerprint})"
+        else
+            log ERROR "Encrypted message has no embedded signature from ${from} — DROPPING"
+            return 1
+        fi
+
+        raw_body="$decrypted_body"
+    fi
+
+    # ── Verify PGP signature (cleartext-signed messages only) ────
+    local cleartext
+    if [[ "$was_encrypted" == "true" ]]; then
+        # Decrypted plaintext is the message body directly (no clearsign wrapper)
+        cleartext="$raw_body"
+    else
+        local signed_block
+        signed_block=$(extract_signed_content "$raw_body")
+
+        if [[ -z "$signed_block" ]]; then
+            log ERROR "No PGP signature found in message from ${from} — DROPPING"
+            return 1
+        fi
+
+        sender_fingerprint=$(pgp_verify_strict "$signed_block") || {
+            log ERROR "PGP verification failed for message from ${from} — DROPPING"
+            return 1
+        }
+
+        log INFO "Verified signature from ${from} (fingerprint: ${sender_fingerprint})"
+
+        cleartext=$(extract_cleartext "$signed_block")
+    fi
+
+    parse_interclaw_headers "$cleartext"
+
+    # ── Validate protocol headers ─────────────────────────────────
+    if [[ -z "$PARSED_GLOBAL_SEQ" ]] || [[ -z "$PARSED_CONV_ID" ]] || [[ -z "$PARSED_CONV_SEQ" ]]; then
+        log ERROR "Missing required headers in message from ${from} — DROPPING"
+        return 1
+    fi
+
+    if ! validate_global_seq "$PARSED_GLOBAL_SEQ"; then
+        log ERROR "Invalid GlobalSeq '${PARSED_GLOBAL_SEQ}' from ${from} — DROPPING"
+        return 1
+    fi
+
+    if ! validate_conv_id "$PARSED_CONV_ID"; then
+        log ERROR "Invalid ConvID '${PARSED_CONV_ID}' from ${from} — DROPPING"
+        return 1
+    fi
+
+    if ! validate_conv_seq "$PARSED_CONV_SEQ"; then
+        log ERROR "Invalid ConvSeq '${PARSED_CONV_SEQ}' from ${from} — DROPPING"
+        return 1
+    fi
+
+    # ── Validate timestamp ────────────────────────────────────────
+    if [[ -n "$PARSED_TIMESTAMP" ]]; then
+        if ! validate_timestamp "$PARSED_TIMESTAMP"; then
+            log ERROR "Invalid timestamp format '${PARSED_TIMESTAMP}' from ${from} — DROPPING"
+            return 1
+        fi
+        local max_age="${INTERCLAW_MAX_MESSAGE_AGE:-86400}"
+        if ! validate_timestamp_age "$PARSED_TIMESTAMP" "$max_age"; then
+            log WARN "Message timestamp ${PARSED_TIMESTAMP} outside ${max_age}s window from ${from} — DROPPING"
+            return 1
+        fi
+    fi
+
+    # ── Check shared secret (if configured) ───────────────────────
+    if [[ -n "${INTERCLAW_SHARED_SECRET:-}" ]]; then
+        if [[ "$PARSED_AGENT_SECRET" != "${INTERCLAW_SHARED_SECRET}" ]]; then
+            log ERROR "Shared secret mismatch from ${from} — DROPPING"
+            return 1
+        fi
+    fi
+
+    # ── Duplicate detection ───────────────────────────────────────
+    if is_duplicate "$PARSED_CONV_ID" "$PARSED_CONV_SEQ"; then
+        log WARN "Duplicate message ${PARSED_CONV_ID}:${PARSED_CONV_SEQ} from ${from} — discarding"
+        return 0
+    fi
+
+    # ── Ensure conversation directory exists ──────────────────────
+    local conv_dir="${INTERCLAW_CONV_DIR}/${PARSED_CONV_ID}"
+    if [[ ! -d "$conv_dir" ]]; then
+        mkdir -p "${conv_dir}/sent" "${conv_dir}/received"
+        local ts; ts=$(now_utc)
+        cat > "${conv_dir}/meta" <<EOF
+topic=${SUBJECT_TOPIC:-unknown}
+tag=${SUBJECT_TAG}
+participants=${from}
+created_at=${ts}
+last_activity=${ts}
+EOF
+        echo "0" > "${conv_dir}/conv_seq"
+        log INFO "Created conversation state for incoming ${PARSED_CONV_ID}"
+    fi
+
+    # ── Gap detection ─────────────────────────────────────────────
+    local last_recv_seq=0
+    local recv_dir="${conv_dir}/received"
+
+    if [[ -d "$recv_dir" ]]; then
+        local highest
+        highest=$(ls "$recv_dir" 2>/dev/null | sed 's/\.msg$//' | sort -n | tail -1)
+        if [[ -n "$highest" ]]; then
+            last_recv_seq=$((10#$highest))
+        fi
+    fi
+
+    local incoming_seq=$((10#$PARSED_CONV_SEQ))
+
+    if (( incoming_seq > last_recv_seq + 1 )); then
+        log WARN "Gap detected in ${PARSED_CONV_ID}: last=${last_recv_seq}, got=${incoming_seq}"
+        local missing_start=$(( last_recv_seq + 1 ))
+        local missing_end=$(( incoming_seq - 1 ))
+        request_missing "$from" "$PARSED_CONV_ID" "$missing_start" "$missing_end"
+    fi
+
+    # ── Archive received message ──────────────────────────────────
+    archive_received_message "$PARSED_CONV_ID" "$PARSED_CONV_SEQ" "$from" "$cleartext"
+
+    local ts; ts=$(now_utc)
+    sed -i "s/^last_activity=.*/last_activity=${ts}/" "${conv_dir}/meta" 2>/dev/null || true
+
+    # ── Route by tag ──────────────────────────────────────────────
+    case "$SUBJECT_TAG" in
+        ACK)
+            handle_ack "$PARSED_CONV_ID" "$PARSED_REF"
+            ;;
+        RECV)
+            log INFO "Delivery receipt from ${from} for ${PARSED_CONV_ID}"
+            ;;
+        HANDSHAKE)
+            handle_handshake "$from" "$PARSED_BODY"
+            ;;
+        MISSING)
+            handle_missing_request "$from" "$PARSED_BODY"
+            ;;
+        PING)
+            log INFO "Ping from ${from} (${PARSED_AGENT_ID})"
+            if [[ "$AUTO_ACK" == "true" ]]; then
+                send_ack "$from" "$PARSED_CONV_ID" "$PARSED_CONV_SEQ"
+            fi
+            ;;
+        ENCRYPTED|COORD|INTEL|RELAY|SELFIMPROVE|MULTI|DIGEST)
+            log INFO "Received [${SUBJECT_TAG}] from ${from}: ${SUBJECT_DESC:-}"
+            echo "[${SUBJECT_TAG}] from ${from}: ${PARSED_BODY}"
+            if [[ "$AUTO_ACK" == "true" ]]; then
+                send_ack "$from" "$PARSED_CONV_ID" "$PARSED_CONV_SEQ"
+            fi
+            ;;
+        *)
+            log WARN "Unknown tag [${SUBJECT_TAG}] from ${from}"
+            ;;
+    esac
+
+    # ── Update threads.json ───────────────────────────────────────
+    generate_threads_json
+
+    log INFO "Processed ${PARSED_CONV_ID}:${PARSED_CONV_SEQ} from ${from} [${SUBJECT_TAG}]"
+    return 0
+}
+
+# ── Tag Handlers ──────────────────────────────────────────────────
+
+handle_ack() {
+    local conv_id="$1"
+    local ref="$2"
+
+    if [[ "$ref" == "none" ]] || [[ -z "$ref" ]]; then
+        log DEBUG "ACK received with no ref"
+        return
+    fi
+
+    local ref_conv_id="${ref%%:*}"
+    local ref_conv_seq="${ref##*:}"
+
+    resolve_pending_ack "$ref_conv_id" "$ref_conv_seq"
+    log INFO "ACK received for ${ref}"
+}
+
+handle_handshake() {
+    local from="$1"
+    local body="$2"
+
+    log INFO "Handshake message from ${from}"
+
+    # Extract public key block from body
+    local pubkey
+    pubkey=$(echo "$body" | sed -n '/-----BEGIN PGP PUBLIC KEY BLOCK-----/,/-----END PGP PUBLIC KEY BLOCK-----/p')
+
+    if [[ -z "$pubkey" ]]; then
+        log WARN "Handshake from ${from} contains no public key"
+        return
+    fi
+
+    # Import the key into the keyring (does NOT auto-trust)
+    local import_result
+    import_result=$(pgp_import_key "$pubkey") || true
+    log INFO "Key import result: ${import_result}"
+
+    # Get the fingerprint of the imported key
+    local fp
+    fp=$(pgp_get_fingerprint "$from")
+
+    if [[ -n "$fp" ]]; then
+        echo "$pubkey" > "${INTERCLAW_KEYS_DIR}/${fp}.asc"
+        log INFO "Saved key for ${from} with fingerprint ${fp}"
+
+        # Only auto-trust if a pending handshake exists with a matching
+        # expected fingerprint (verified out-of-band). Per protocol spec:
+        # "No automatic key trust — ever" without verification.
+        local auto_trusted=false
+        if get_pending_handshake "$from" 2>/dev/null; then
+            if [[ -n "${HS_FINGERPRINT:-}" ]] && [[ "$HS_FINGERPRINT" == "$fp" ]]; then
+                log INFO "Fingerprint matches expected value from pending handshake"
+                add_trusted_fingerprint "$fp"
+                remove_pending_handshake "$from"
+                auto_trusted=true
+                echo "Handshake: key from ${from} verified and trusted (${fp})"
+            elif [[ -z "${HS_FINGERPRINT:-}" ]]; then
+                log INFO "Pending handshake found but no expected fingerprint was set"
+                remove_pending_handshake "$from"
+                echo "Handshake: key received from ${from} (${fp})"
+                echo "  WARNING: No expected fingerprint — verify out-of-band before trusting."
+                echo "  To trust: interclaw-config add-peer --fingerprint ${fp}"
+            else
+                log WARN "Fingerprint mismatch! Expected ${HS_FINGERPRINT}, got ${fp}"
+                echo "HANDSHAKE WARNING: fingerprint mismatch for ${from}!"
+                echo "  Expected: ${HS_FINGERPRINT}"
+                echo "  Got:      ${fp}"
+                echo "  Key imported but NOT trusted. Possible MITM."
+            fi
+        else
+            echo "Handshake: key received from ${from} (${fp})"
+            echo "  Key imported to keyring but NOT automatically trusted."
+            echo "  Verify fingerprint out-of-band, then run:"
+            echo "  interclaw-config add-peer --fingerprint ${fp}"
+        fi
+
+        if [[ "$auto_trusted" != "true" ]]; then
+            log INFO "Key from ${from} imported but not auto-trusted (per protocol: manual verification required)"
+        fi
+    else
+        log WARN "Could not determine fingerprint for key from ${from}"
+    fi
+}
+
+handle_missing_request() {
+    local from="$1"
+    local body="$2"
+
+    log INFO "MISSING request from ${from}"
+
+    local req_conv_id=""
+    local missing_seqs=""
+
+    local line
+    while IFS= read -r line; do
+        case "$line" in
+            ConvID:*)  req_conv_id=$(echo "$line" | sed 's/^ConvID:[[:space:]]*//') ;;
+            Missing:*) missing_seqs=$(echo "$line" | sed 's/^Missing:[[:space:]]*//') ;;
+        esac
+    done <<< "$body"
+
+    if [[ -z "$req_conv_id" ]] || [[ -z "$missing_seqs" ]]; then
+        log WARN "Malformed MISSING request from ${from}"
+        return
+    fi
+
+    if ! check_rate_limit "${from}_missing" 10; then
+        log WARN "MISSING rate limit exceeded for ${from}"
+        return
+    fi
+
+    local IFS=','
+    local seq
+    for seq in $missing_seqs; do
+        seq="${seq## }"
+        seq="${seq%% }"
+        local padded_seq; padded_seq=$(printf "%03d" "$((10#$seq))")
+        local archived_msg
+
+        # Read original tag to preserve it on retransmit
+        local orig_tag="COORD"
+        local tag_file="${INTERCLAW_CONV_DIR}/${req_conv_id}/sent/${padded_seq}.tag"
+        if [[ -f "$tag_file" ]]; then
+            orig_tag=$(cat "$tag_file")
+        fi
+
+        if archived_msg=$(get_archived_message "$req_conv_id" "$padded_seq"); then
+            # Re-encrypt if the original was encrypted
+            if [[ "$orig_tag" == "ENCRYPTED" ]]; then
+                log INFO "Re-encrypting retransmit ${req_conv_id}:${padded_seq} to ${from}"
+                local encrypted
+                encrypted=$(pgp_sign_and_encrypt "$archived_msg" "$from") || {
+                    log ERROR "Failed to re-encrypt ${req_conv_id}:${padded_seq} for retransmit"
+                    continue
+                }
+                himalaya_send "$from" "[ENCRYPTED] Retransmit ${req_conv_id}:${padded_seq}" "$encrypted" || \
+                    log ERROR "Failed to retransmit ${req_conv_id}:${padded_seq}"
+                continue
+            fi
+            log INFO "Retransmitting ${req_conv_id}:${padded_seq} [${orig_tag}] to ${from}"
+            local signed
+            signed=$(pgp_sign "$archived_msg") || continue
+            himalaya_send "$from" "[${orig_tag}] Retransmit ${req_conv_id}:${padded_seq}" "$signed" || \
+                log ERROR "Failed to retransmit ${req_conv_id}:${padded_seq}"
+        else
+            log WARN "Cannot retransmit ${req_conv_id}:${padded_seq} — not in archive"
+        fi
+    done
+}
+
+# ── Auto-ACK ─────────────────────────────────────────────────────
+
+send_ack() {
+    local to="$1"
+    local conv_id="$2"
+    local conv_seq="$3"
+
+    log DEBUG "Sending ACK to ${to} for ${conv_id}:${conv_seq}"
+
+    # ACKs use their own ConvID (no --conv-id) to avoid incrementing
+    # the original conversation's ConvSeq on the receiver's side.
+    "${SCRIPT_DIR}/interclaw-send" \
+        --to "$to" \
+        --tag ACK \
+        --topic ack \
+        --ref "${conv_id}:${conv_seq}" \
+        --subject "ACK ${conv_id}:${conv_seq}" \
+        --body "Acknowledged ${conv_id}:${conv_seq}" \
+        2>/dev/null || log WARN "Failed to send ACK to ${to}"
+}
+
+# ── MISSING Request ───────────────────────────────────────────────
+
+request_missing() {
+    local to="$1"
+    local conv_id="$2"
+    local start_seq="$3"
+    local end_seq="$4"
+
+    local missing_list=""
+    local i
+    for (( i=start_seq; i<=end_seq; i++ )); do
+        [[ -n "$missing_list" ]] && missing_list="${missing_list},"
+        missing_list="${missing_list}$(printf "%03d" "$i")"
+    done
+
+    log INFO "Requesting retransmit from ${to}: ${conv_id} seqs ${missing_list}"
+
+    local body="ConvID: ${conv_id}
+Missing: ${missing_list}"
+
+    # MISSING requests use their own ConvID (no --conv-id) to avoid
+    # incrementing the original conversation's ConvSeq.
+    "${SCRIPT_DIR}/interclaw-send" \
+        --to "$to" \
+        --tag MISSING \
+        --topic missing \
+        --subject "MISSING ${conv_id}: ${missing_list}" \
+        --body "$body" \
+        2>/dev/null || log WARN "Failed to send MISSING request to ${to}"
+}
+
+# ══════════════════════════════════════════════════════════════════
+# INPUT MODE: Process a single raw email (used by all three modes)
+# ══════════════════════════════════════════════════════════════════
+
+process_raw_email() {
+    local raw_email="$1"
+    local source_id="${2:-raw}"
+
+    # Parse RFC 822 headers + body
+    parse_raw_email "$raw_email"
+
+    # ── Strict InterClaw filter ───────────────────────────────────
+    # Only process messages that are InterClaw protocol messages.
+    # This ensures we never touch non-InterClaw mail.
+    if ! is_interclaw_message; then
+        log DEBUG "Skipping non-InterClaw message from ${RAW_FROM:-unknown}: ${RAW_SUBJECT:-<no subject>}"
+        return 0
+    fi
+
+    log INFO "InterClaw message detected from ${RAW_FROM}: ${RAW_SUBJECT}"
+
+    # ── Hand off to unified processing pipeline ───────────────────
+    process_message "$source_id" "$RAW_FROM" "$RAW_SUBJECT" "$RAW_BODY"
+}
+
+# ══════════════════════════════════════════════════════════════════
+# INPUT MODE: --poll / --once (himalaya convenience poller)
+# ══════════════════════════════════════════════════════════════════
+
+poll_once() {
+    log DEBUG "Polling IMAP via himalaya for new messages..."
+
+    # Build himalaya account flag if specified
+    local acct_flag=""
+    if [[ -n "$HIMALAYA_ACCOUNT" ]]; then
+        acct_flag="--account ${HIMALAYA_ACCOUNT}"
+    fi
+
+    # List unread messages
+    local msg_list
+    # shellcheck disable=SC2086
+    msg_list=$(himalaya $acct_flag list --folder INBOX --query "unseen" 2>/dev/null) || {
+        log WARN "Failed to list messages from IMAP"
+        return 1
+    }
+
+    if [[ -z "$msg_list" ]]; then
+        log DEBUG "No new messages"
+        return 0
+    fi
+
+    # Parse himalaya table output: ID | FLAGS | FROM | SUBJECT
+    local msg_id from subject
+    while IFS='|' read -r msg_id _ from subject; do
+        # Trim whitespace
+        msg_id="${msg_id## }"
+        msg_id="${msg_id%% }"
+        from="${from## }"
+        from="${from%% }"
+        subject="${subject## }"
+        subject="${subject%% }"
+
+        # Skip header/separator lines
+        [[ -z "$msg_id" ]] && continue
+        [[ "$msg_id" =~ ^-+$ ]] && continue
+        [[ "$msg_id" == "ID" ]] && continue
+
+        # No pre-filter here — process_raw_email() applies comprehensive
+        # InterClaw filtering (subject tags, X-Agent-ID header, body headers).
+        # Pre-filtering on subject alone would miss valid messages.
+
+        log INFO "Fetching message ${msg_id} from ${from}"
+
+        # Download raw message for proper parsing
+        local raw_msg
+        # shellcheck disable=SC2086
+        raw_msg=$(himalaya $acct_flag read --raw "$msg_id" 2>/dev/null) || {
+            # Fallback: try plain text read if --raw not supported
+            # shellcheck disable=SC2086
+            local plain_body
+            plain_body=$(himalaya $acct_flag read --plain "$msg_id" 2>/dev/null) || {
+                log WARN "Failed to read message ${msg_id}"
+                continue
+            }
+            # Construct a minimal raw email for the processing pipeline
+            raw_msg="From: ${from}
+Subject: ${subject}
+
+${plain_body}"
+        }
+
+        # Process through the unified pipeline
+        if process_raw_email "$raw_msg" "himalaya:${msg_id}"; then
+            # shellcheck disable=SC2086
+            himalaya $acct_flag move "$msg_id" "InterClaw/Processed" 2>/dev/null || true
+        else
+            # shellcheck disable=SC2086
+            himalaya $acct_flag move "$msg_id" "InterClaw/Failed" 2>/dev/null || true
+        fi
+
+    done <<< "$msg_list"
+
+    return 0
+}
+
+# ══════════════════════════════════════════════════════════════════
+# MAIN — dispatch to the selected input mode
+# ══════════════════════════════════════════════════════════════════
+
+case "$MODE" in
+    once)
+        check_dependencies
+        log INFO "Single poll cycle"
+        poll_once
+        echo "Poll complete."
+        ;;
+
+    poll)
+        check_dependencies
+        log INFO "Starting continuous polling (interval: ${POLL_INTERVAL}m)"
+        echo "InterClaw receiver started. Polling every ${POLL_INTERVAL} minute(s)."
+        echo "Press Ctrl+C to stop."
+
+        trap 'echo ""; log INFO "Receiver stopped"; echo "Receiver stopped."; exit 0' INT TERM
+
+        while true; do
+            poll_once || true
+            sleep $(( POLL_INTERVAL * 60 ))
+        done
+        ;;
+
+    file)
+        if [[ ! -f "$PROCESS_FILE" ]]; then
+            die "File not found: ${PROCESS_FILE}"
+        fi
+        log INFO "Processing file: ${PROCESS_FILE}"
+        raw_email=$(cat "$PROCESS_FILE")
+        process_raw_email "$raw_email" "file:${PROCESS_FILE}"
+        ;;
+
+    stdin)
+        log INFO "Reading raw email from stdin"
+        raw_email=$(cat)
+        if [[ -z "$raw_email" ]]; then
+            die "No input received on stdin"
+        fi
+        process_raw_email "$raw_email" "stdin"
+        ;;
+esac

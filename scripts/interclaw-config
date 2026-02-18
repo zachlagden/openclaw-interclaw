@@ -1,0 +1,654 @@
+#!/usr/bin/env bash
+# interclaw-config — Configuration manager for InterClaw.
+#
+# Usage:
+#   interclaw-config init                       # Initialize config from template
+#   interclaw-config check                      # Verify config and dependencies
+#   interclaw-config get <key>                  # Get a config value
+#   interclaw-config set <key> <value>          # Set a config value
+#   interclaw-config list                       # List all config values
+#   interclaw-config add-peer <email> [<fp>]    # Add a trusted peer
+#   interclaw-config remove-peer <fingerprint>  # Remove a trusted peer
+#   interclaw-config list-peers                 # List trusted peers
+#   interclaw-config export-key                 # Export your public key
+#   interclaw-config reset                      # Reset state (keeps config)
+
+set -euo pipefail
+
+# ── Resolve script directory and source library ───────────────────
+# Resolve through symlinks so sourcing interclaw-lib works from ~/.local/bin
+_self="${BASH_SOURCE[0]}"
+if command -v readlink &>/dev/null; then
+    _self="$(readlink -f "$_self" 2>/dev/null || readlink "$_self" 2>/dev/null || echo "$_self")"
+fi
+SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
+unset _self
+# shellcheck source=interclaw-lib
+source "${SCRIPT_DIR}/interclaw-lib"
+
+# ── Usage ─────────────────────────────────────────────────────────
+usage() {
+    cat <<'EOF'
+Usage: interclaw-config <command> [args]
+
+Commands:
+  init [OPTIONS]             Initialize config, PGP key, and himalaya config
+  check                      Verify config and dependencies
+  get <key>                  Get a config value
+  set <key> <value>          Set a config value
+  list                       List all config values (secrets masked)
+  add-peer <email> [<fp>]    Add a trusted peer by email or fingerprint
+  remove-peer <fingerprint>  Remove a trusted peer
+  list-peers                 List trusted peers
+  export-key                 Export your public PGP key
+  reset                      Reset state (keeps config and keys)
+
+Init options:
+  --email <addr>         Agent email (required)
+  --agent-id <id>        Agent identifier (default: derived from email)
+  --smtp-host <host>     SMTP server (required)
+  --smtp-port <port>     SMTP port (default: 587)
+  --smtp-user <user>     SMTP username (default: email)
+  --smtp-pass <pass>     SMTP password (required)
+  --imap-host <host>     IMAP server (default: derived from smtp-host)
+  --imap-port <port>     IMAP port (default: 993)
+  --imap-user <user>     IMAP username (default: email)
+  --imap-pass <pass>     IMAP password (default: smtp-pass)
+  --pgp-key-id <id>      Use existing PGP key (skip generation)
+  --no-pgp-gen           Skip PGP key generation entirely
+EOF
+    exit 0
+}
+
+[[ $# -lt 1 ]] && usage
+
+COMMAND="$1"; shift
+
+# ── Commands ──────────────────────────────────────────────────────
+
+cmd_init() {
+    echo "Initializing InterClaw configuration..."
+    echo ""
+
+    # ── Bail if config exists ─────────────────────────────────────
+    if [[ -f "${INTERCLAW_CONFIG}" ]]; then
+        echo "Config already exists at ${INTERCLAW_CONFIG}"
+        echo "To reconfigure, edit the file directly or run: interclaw-config set <key> <value>"
+        return
+    fi
+
+    # ── Auto-bootstrap if deps missing ────────────────────────────
+    local needs_bootstrap=false
+    if ! command -v gpg &>/dev/null || ! command -v himalaya &>/dev/null; then
+        needs_bootstrap=true
+    fi
+
+    if [[ "$needs_bootstrap" == "true" ]] && [[ -x "${SCRIPT_DIR}/interclaw-bootstrap" ]]; then
+        echo "Dependencies missing — running bootstrap..."
+        echo ""
+        "${SCRIPT_DIR}/interclaw-bootstrap"
+        echo ""
+    fi
+
+    # ── Parse flags ───────────────────────────────────────────────
+    local opt_email="" opt_agent_id="" opt_smtp_host="" opt_smtp_port=""
+    local opt_smtp_user="" opt_smtp_pass="" opt_imap_host="" opt_imap_port=""
+    local opt_imap_user="" opt_imap_pass="" opt_pgp_key_id="" opt_no_pgp_gen=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --email)       opt_email="$2"; shift 2 ;;
+            --agent-id)    opt_agent_id="$2"; shift 2 ;;
+            --smtp-host)   opt_smtp_host="$2"; shift 2 ;;
+            --smtp-port)   opt_smtp_port="$2"; shift 2 ;;
+            --smtp-user)   opt_smtp_user="$2"; shift 2 ;;
+            --smtp-pass)   opt_smtp_pass="$2"; shift 2 ;;
+            --imap-host)   opt_imap_host="$2"; shift 2 ;;
+            --imap-port)   opt_imap_port="$2"; shift 2 ;;
+            --imap-user)   opt_imap_user="$2"; shift 2 ;;
+            --imap-pass)   opt_imap_pass="$2"; shift 2 ;;
+            --pgp-key-id)  opt_pgp_key_id="$2"; shift 2 ;;
+            --no-pgp-gen)  opt_no_pgp_gen=true; shift ;;
+            *)             echo "Unknown init option: $1"; return 1 ;;
+        esac
+    done
+
+    # ── Prompt for missing required values ────────────────────────
+    if [[ -z "$opt_email" ]]; then
+        read -rp "Agent email address: " opt_email
+    fi
+    [[ -z "$opt_email" ]] && die "Email is required"
+    validate_email "$opt_email" || die "Invalid email: ${opt_email}"
+
+    if [[ -z "$opt_smtp_host" ]]; then
+        read -rp "SMTP host (e.g. smtp.fastmail.com): " opt_smtp_host
+    fi
+    [[ -z "$opt_smtp_host" ]] && die "SMTP host is required"
+
+    if [[ -z "$opt_smtp_pass" ]]; then
+        read -rsp "SMTP password: " opt_smtp_pass
+        echo ""
+    fi
+    [[ -z "$opt_smtp_pass" ]] && die "SMTP password is required"
+
+    # ── Auto-derive defaults ──────────────────────────────────────
+    local email_local="${opt_email%%@*}"
+    local email_local_capitalized
+    email_local_capitalized="$(echo "${email_local:0:1}" | tr '[:lower:]' '[:upper:]')${email_local:1}"
+
+    [[ -z "$opt_agent_id" ]]  && opt_agent_id="${email_local_capitalized}/1.0"
+    [[ -z "$opt_smtp_port" ]] && opt_smtp_port="587"
+    [[ -z "$opt_smtp_user" ]] && opt_smtp_user="$opt_email"
+    [[ -z "$opt_imap_host" ]] && opt_imap_host="${opt_smtp_host/smtp./imap.}"
+    [[ -z "$opt_imap_port" ]] && opt_imap_port="993"
+    [[ -z "$opt_imap_user" ]] && opt_imap_user="$opt_email"
+    [[ -z "$opt_imap_pass" ]] && opt_imap_pass="$opt_smtp_pass"
+
+    # ── PGP key generation ────────────────────────────────────────
+    local pgp_key_id="$opt_pgp_key_id"
+    local pgp_fingerprint=""
+
+    if [[ -z "$pgp_key_id" ]] && [[ "$opt_no_pgp_gen" != "true" ]]; then
+        # Check if a key already exists for this email
+        local existing_fp
+        existing_fp=$(gpg --batch --with-colons --fingerprint "$opt_email" 2>/dev/null \
+            | grep "^fpr:" | head -1 | cut -d: -f10 || true)
+
+        if [[ -n "$existing_fp" ]]; then
+            echo "PGP key already exists for ${opt_email}: ${existing_fp}"
+            echo "Using existing key."
+            pgp_key_id="$opt_email"
+            pgp_fingerprint="$existing_fp"
+        else
+            echo "Generating PGP key for ${opt_email}..."
+            gpg --batch --gen-key <<PGPEOF
+%no-protection
+Key-Type: eddsa
+Key-Curve: ed25519
+Subkey-Type: ecdh
+Subkey-Curve: cv25519
+Name-Real: ${opt_agent_id}
+Name-Email: ${opt_email}
+Expire-Date: 0
+%commit
+PGPEOF
+            pgp_key_id="$opt_email"
+            pgp_fingerprint=$(gpg --batch --with-colons --fingerprint "$opt_email" 2>/dev/null \
+                | grep "^fpr:" | head -1 | cut -d: -f10 || true)
+            echo "PGP key generated: ${pgp_fingerprint}"
+        fi
+    elif [[ -n "$pgp_key_id" ]]; then
+        pgp_fingerprint=$(gpg --batch --with-colons --fingerprint "$pgp_key_id" 2>/dev/null \
+            | grep "^fpr:" | head -1 | cut -d: -f10 || true)
+    fi
+
+    # ── Create directories ────────────────────────────────────────
+    ensure_dirs
+
+    # ── Write populated config.env ────────────────────────────────
+    cat > "${INTERCLAW_CONFIG}" <<CONFIGEOF
+# InterClaw Configuration
+# Generated by interclaw-config init on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# --- Identity ---
+INTERCLAW_EMAIL="${opt_email}"
+INTERCLAW_AGENT_ID="${opt_agent_id}"
+
+# --- SMTP (Outbound) ---
+INTERCLAW_SMTP_HOST="${opt_smtp_host}"
+INTERCLAW_SMTP_PORT="${opt_smtp_port}"
+INTERCLAW_SMTP_USER="${opt_smtp_user}"
+INTERCLAW_SMTP_PASS="${opt_smtp_pass}"
+
+# --- IMAP (Inbound) ---
+INTERCLAW_IMAP_HOST="${opt_imap_host}"
+INTERCLAW_IMAP_PORT="${opt_imap_port}"
+INTERCLAW_IMAP_USER="${opt_imap_user}"
+INTERCLAW_IMAP_PASS="${opt_imap_pass}"
+
+# --- PGP ---
+PGP_PRIVATE_KEY_ID="${pgp_key_id}"
+PGP_PASSPHRASE=""
+
+# --- Security ---
+INTERCLAW_TRUSTED_FINGERPRINTS=""
+INTERCLAW_SHARED_SECRET=""
+
+# --- Behaviour ---
+INTERCLAW_POLL_INTERVAL="5"
+INTERCLAW_AUTO_ACK="true"
+INTERCLAW_LOG_LEVEL="INFO"
+
+# --- Himalaya ---
+HIMALAYA_CONFIG="${INTERCLAW_DIR}/himalaya.toml"
+CONFIGEOF
+    chmod 600 "${INTERCLAW_CONFIG}"
+
+    # ── Generate himalaya TOML ────────────────────────────────────
+    local himalaya_toml="${INTERCLAW_DIR}/himalaya.toml"
+
+    # Determine encryption type based on port
+    local smtp_encryption="start-tls"
+    if [[ "$opt_smtp_port" == "465" ]]; then
+        smtp_encryption="tls"
+    fi
+    local imap_encryption="tls"
+    if [[ "$opt_imap_port" != "993" ]]; then
+        imap_encryption="start-tls"
+    fi
+
+    cat > "$himalaya_toml" <<TOMLEOF
+[accounts.default]
+email = "${opt_email}"
+display-name = "${opt_agent_id}"
+folder.alias.inbox = "INBOX"
+folder.alias.sent = "Sent"
+
+[accounts.default.message.send]
+backend = "smtp"
+
+[accounts.default.message.send.smtp]
+host = "${opt_smtp_host}"
+port = ${opt_smtp_port}
+encryption = "${smtp_encryption}"
+login = "${opt_smtp_user}"
+auth.type = "password"
+auth.raw = "${opt_smtp_pass}"
+
+[accounts.default.backend]
+type = "imap"
+
+[accounts.default.backend.imap]
+host = "${opt_imap_host}"
+port = ${opt_imap_port}
+encryption = "${imap_encryption}"
+login = "${opt_imap_user}"
+auth.type = "password"
+auth.raw = "${opt_imap_pass}"
+TOMLEOF
+    chmod 600 "$himalaya_toml"
+
+    # ── Summary ───────────────────────────────────────────────────
+    echo ""
+    echo "InterClaw Initialization Complete"
+    echo "================================="
+    echo ""
+    echo "  Config:       ${INTERCLAW_CONFIG}"
+    echo "  Himalaya:     ${himalaya_toml}"
+    echo "  Email:        ${opt_email}"
+    echo "  Agent ID:     ${opt_agent_id}"
+    echo "  SMTP:         ${opt_smtp_host}:${opt_smtp_port}"
+    echo "  IMAP:         ${opt_imap_host}:${opt_imap_port}"
+    if [[ -n "$pgp_fingerprint" ]]; then
+        echo "  PGP Key:      ${pgp_fingerprint}"
+    elif [[ -n "$pgp_key_id" ]]; then
+        echo "  PGP Key ID:   ${pgp_key_id}"
+    else
+        echo "  PGP Key:      (none — use --pgp-key-id or generate manually)"
+    fi
+    echo ""
+    echo "Next steps:"
+    echo "  1. Run: interclaw-config check"
+    echo "  2. Run: interclaw-handshake --peer <peer-email>"
+}
+
+cmd_check() {
+    echo "InterClaw Configuration Check"
+    echo "══════════════════════════════"
+    echo ""
+
+    local errors=0
+
+    # Check binaries
+    echo "Dependencies:"
+    local bins=("gpg" "himalaya" "curl" "uuidgen")
+    for bin in "${bins[@]}"; do
+        if command -v "$bin" &>/dev/null; then
+            local ver
+            ver=$("$bin" --version 2>/dev/null | head -1 || echo "unknown")
+            printf "  %-12s OK  (%s)\n" "$bin" "$ver"
+        else
+            printf "  %-12s MISSING\n" "$bin"
+            errors=$(( errors + 1 ))
+        fi
+    done
+    echo ""
+
+    # Check config file
+    echo "Configuration:"
+    if [[ -f "${INTERCLAW_CONFIG}" ]]; then
+        echo "  Config file:  ${INTERCLAW_CONFIG} (exists)"
+
+        # Check permissions
+        local perms
+        perms=$(stat -c "%a" "${INTERCLAW_CONFIG}" 2>/dev/null || stat -f "%Lp" "${INTERCLAW_CONFIG}" 2>/dev/null || echo "unknown")
+        if [[ "$perms" == "600" ]]; then
+            echo "  Permissions:  ${perms} (OK)"
+        else
+            echo "  Permissions:  ${perms} (WARNING: should be 600)"
+        fi
+
+        # Check required values
+        load_config 2>/dev/null || true
+        local required=("INTERCLAW_EMAIL" "INTERCLAW_SMTP_HOST" "INTERCLAW_IMAP_HOST" "PGP_PRIVATE_KEY_ID")
+        for var in "${required[@]}"; do
+            if [[ -n "${!var:-}" ]]; then
+                # Mask sensitive values
+                local val="${!var}"
+                if [[ "$var" == *"PASS"* ]] || [[ "$var" == *"SECRET"* ]] || [[ "$var" == *"KEY"* ]]; then
+                    val="****"
+                fi
+                printf "  %-30s %s\n" "$var" "$val"
+            else
+                printf "  %-30s NOT SET\n" "$var"
+                errors=$(( errors + 1 ))
+            fi
+        done
+    else
+        echo "  Config file:  NOT FOUND"
+        echo "  Run: interclaw-config init"
+        errors=$(( errors + 1 ))
+    fi
+    echo ""
+
+    # Check PGP key
+    echo "PGP Key:"
+    if [[ -n "${PGP_PRIVATE_KEY_ID:-}" ]]; then
+        local fp
+        fp=$(pgp_get_fingerprint "${PGP_PRIVATE_KEY_ID}" 2>/dev/null || echo "")
+        if [[ -n "$fp" ]]; then
+            echo "  Key ID:       ${PGP_PRIVATE_KEY_ID}"
+            echo "  Fingerprint:  ${fp}"
+
+            # Test signing
+            local test_sig
+            test_sig=$(echo "test" | gpg --batch --yes --local-user "${PGP_PRIVATE_KEY_ID}" --clearsign 2>/dev/null) || true
+            if [[ -n "$test_sig" ]]; then
+                echo "  Signing:      OK"
+            else
+                echo "  Signing:      FAILED (check passphrase)"
+                errors=$(( errors + 1 ))
+            fi
+        else
+            echo "  Key ID:       ${PGP_PRIVATE_KEY_ID} (NOT FOUND in keyring)"
+            errors=$(( errors + 1 ))
+        fi
+    else
+        echo "  Key ID:       NOT CONFIGURED"
+        errors=$(( errors + 1 ))
+    fi
+    echo ""
+
+    # Check state
+    echo "State:"
+    local global_seq
+    global_seq=$(cat "${INTERCLAW_GLOBAL_SEQ_FILE}" 2>/dev/null || echo "0")
+    echo "  Global Seq:   D-$(printf '%03d' "$global_seq")"
+
+    local conv_count=0
+    for d in "${INTERCLAW_CONV_DIR}"/*/; do
+        [[ -d "$d" ]] && conv_count=$(( conv_count + 1 ))
+    done
+    echo "  Conversations: ${conv_count}"
+
+    local ack_count=0
+    for f in "${INTERCLAW_ACKS_DIR}"/*; do
+        [[ -f "$f" ]] && ack_count=$(( ack_count + 1 ))
+    done
+    echo "  Pending ACKs: ${ack_count}"
+
+    local peer_count=0
+    for f in "${INTERCLAW_KEYS_DIR}"/*.asc; do
+        [[ -f "$f" ]] && peer_count=$(( peer_count + 1 ))
+    done
+    echo "  Trusted Peers: ${peer_count}"
+    echo ""
+
+    # Summary
+    if (( errors == 0 )); then
+        echo "Status: ALL CHECKS PASSED"
+    else
+        echo "Status: ${errors} ERROR(S) FOUND"
+        echo "Fix the issues above before using InterClaw."
+    fi
+}
+
+cmd_get() {
+    local key="${1:-}"
+    [[ -z "$key" ]] && die "Usage: interclaw-config get <key>"
+
+    if [[ ! -f "${INTERCLAW_CONFIG}" ]]; then
+        die "Config not found. Run: interclaw-config init"
+    fi
+
+    local value
+    value=$(grep "^${key}=" "${INTERCLAW_CONFIG}" 2>/dev/null | head -1 | cut -d= -f2-)
+    # Strip quotes
+    value="${value#\"}"
+    value="${value%\"}"
+    value="${value#\'}"
+    value="${value%\'}"
+
+    if [[ -n "$value" ]]; then
+        echo "$value"
+    else
+        echo "(not set)"
+        return 1
+    fi
+}
+
+cmd_set() {
+    local key="${1:-}"
+    local value="${2:-}"
+    [[ -z "$key" ]] && die "Usage: interclaw-config set <key> <value>"
+
+    if [[ ! -f "${INTERCLAW_CONFIG}" ]]; then
+        die "Config not found. Run: interclaw-config init"
+    fi
+
+    # Validate key format (only allow known prefixes and safe characters)
+    if [[ ! "$key" =~ ^(INTERCLAW_|PGP_|HIMALAYA_)[A-Z_]+$ ]]; then
+        die "Invalid config key: ${key}. Must start with INTERCLAW_, PGP_, or HIMALAYA_ and contain only uppercase letters and underscores"
+    fi
+
+    # Escape sed special characters in value to prevent injection.
+    # The delimiter is |, so escape |, &, and \ in the replacement string.
+    local escaped_value
+    escaped_value=$(printf '%s' "$value" | sed 's/[|&\\]/\\&/g')
+
+    if grep -q "^${key}=" "${INTERCLAW_CONFIG}" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=\"${escaped_value}\"|" "${INTERCLAW_CONFIG}"
+        echo "Updated: ${key}"
+    else
+        echo "${key}=\"${value}\"" >> "${INTERCLAW_CONFIG}"
+        echo "Added: ${key}"
+    fi
+}
+
+cmd_list() {
+    if [[ ! -f "${INTERCLAW_CONFIG}" ]]; then
+        die "Config not found. Run: interclaw-config init"
+    fi
+
+    echo "InterClaw Configuration (${INTERCLAW_CONFIG})"
+    echo "══════════════════════════════════════════════"
+    echo ""
+
+    while IFS= read -r line; do
+        # Skip comments and blank lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+
+        local key="${line%%=*}"
+        local val="${line#*=}"
+        val="${val#\"}"
+        val="${val%\"}"
+
+        # Mask sensitive values
+        if [[ "$key" == *"PASS"* ]] || [[ "$key" == *"SECRET"* ]] || [[ "$key" == *"PASSPHRASE"* ]]; then
+            if [[ -n "$val" ]]; then
+                val="********"
+            fi
+        fi
+
+        printf "  %-35s %s\n" "$key" "$val"
+    done < "${INTERCLAW_CONFIG}"
+    echo ""
+}
+
+cmd_add_peer() {
+    local email="${1:-}"
+    local fingerprint="${2:-}"
+
+    [[ -z "$email" ]] && die "Usage: interclaw-config add-peer <email> [<fingerprint>]"
+    validate_email "$email" || die "Invalid email: ${email}"
+
+    ensure_dirs
+    load_config 2>/dev/null || true
+
+    if [[ -z "$fingerprint" ]]; then
+        # Try to get fingerprint from keyring
+        fingerprint=$(pgp_get_fingerprint "$email" 2>/dev/null || echo "")
+        if [[ -z "$fingerprint" ]]; then
+            echo "No PGP key found for ${email} in local keyring."
+            echo "Either:"
+            echo "  1. Run: interclaw-handshake --peer ${email}"
+            echo "  2. Import their key manually: gpg --import <keyfile>"
+            echo "  3. Specify fingerprint: interclaw-config add-peer ${email} <fingerprint>"
+            return 1
+        fi
+    fi
+
+    # Export key to trusted_keys dir
+    local pubkey
+    pubkey=$(gpg --armor --export "$fingerprint" 2>/dev/null || echo "")
+    if [[ -n "$pubkey" ]]; then
+        echo "$pubkey" > "${INTERCLAW_KEYS_DIR}/${fingerprint}.asc"
+    fi
+
+    add_trusted_fingerprint "$fingerprint"
+
+    echo "Added trusted peer:"
+    echo "  Email:       ${email}"
+    echo "  Fingerprint: ${fingerprint}"
+}
+
+cmd_remove_peer() {
+    local fingerprint="${1:-}"
+    [[ -z "$fingerprint" ]] && die "Usage: interclaw-config remove-peer <fingerprint>"
+
+    ensure_dirs
+    load_config 2>/dev/null || true
+
+    # Remove key file
+    rm -f "${INTERCLAW_KEYS_DIR}/${fingerprint}.asc"
+
+    # Remove from trusted fingerprints list
+    local current="${INTERCLAW_TRUSTED_FINGERPRINTS:-}"
+    local new_list=""
+    local IFS=','
+    for fp in $current; do
+        fp="${fp## }"
+        fp="${fp%% }"
+        if [[ "$fp" != "$fingerprint" ]]; then
+            if [[ -n "$new_list" ]]; then
+                new_list="${new_list},${fp}"
+            else
+                new_list="$fp"
+            fi
+        fi
+    done
+
+    if [[ -f "${INTERCLAW_CONFIG}" ]]; then
+        if grep -q "^INTERCLAW_TRUSTED_FINGERPRINTS=" "${INTERCLAW_CONFIG}"; then
+            sed -i "s|^INTERCLAW_TRUSTED_FINGERPRINTS=.*|INTERCLAW_TRUSTED_FINGERPRINTS=\"${new_list}\"|" "${INTERCLAW_CONFIG}"
+        fi
+    fi
+
+    echo "Removed trusted peer: ${fingerprint}"
+}
+
+cmd_list_peers() {
+    ensure_dirs
+    load_config 2>/dev/null || true
+
+    echo "Trusted Peers"
+    echo "══════════════════════════════════════════════"
+    echo ""
+
+    local count=0
+
+    # From trusted_keys directory
+    for keyfile in "${INTERCLAW_KEYS_DIR}"/*.asc; do
+        [[ -f "$keyfile" ]] || continue
+        local fp; fp=$(basename "$keyfile" .asc)
+        local uid
+        uid=$(gpg --batch --with-colons --list-keys "$fp" 2>/dev/null | grep "^uid:" | head -1 | cut -d: -f10 || echo "unknown")
+        printf "  %-44s %s\n" "$fp" "$uid"
+        count=$(( count + 1 ))
+    done
+
+    if (( count == 0 )); then
+        echo "  No trusted peers."
+        echo ""
+        echo "  Add peers with:"
+        echo "    interclaw-handshake --peer <email>"
+        echo "    interclaw-config add-peer <email>"
+    fi
+    echo ""
+}
+
+cmd_export_key() {
+    load_config 2>/dev/null || true
+
+    if [[ -z "${PGP_PRIVATE_KEY_ID:-}" ]]; then
+        die "PGP_PRIVATE_KEY_ID not configured"
+    fi
+
+    local pubkey
+    pubkey=$(pgp_export_pubkey) || die "Failed to export public key"
+    local fp
+    fp=$(pgp_get_fingerprint "${PGP_PRIVATE_KEY_ID}")
+
+    echo "Your InterClaw Public Key"
+    echo "══════════════════════════"
+    echo "Fingerprint: ${fp}"
+    echo ""
+    echo "$pubkey"
+}
+
+cmd_reset() {
+    echo "This will reset all InterClaw state (conversations, sequences, ACKs)."
+    echo "Config and trusted keys will be preserved."
+    echo ""
+    read -rp "Are you sure? (type YES to confirm): " confirm
+
+    if [[ "$confirm" != "YES" ]]; then
+        echo "Cancelled."
+        return
+    fi
+
+    rm -rf "${INTERCLAW_STATE_DIR}"
+    rm -rf "${INTERCLAW_SENT_ARCHIVE}"
+
+    ensure_dirs
+
+    echo "State reset complete."
+    echo "Global sequence reset to D-000."
+}
+
+# ── Dispatch ──────────────────────────────────────────────────────
+case "$COMMAND" in
+    init)         cmd_init "$@" ;;
+    check)        cmd_check "$@" ;;
+    get)          cmd_get "$@" ;;
+    set)          cmd_set "$@" ;;
+    list)         cmd_list "$@" ;;
+    add-peer)     cmd_add_peer "$@" ;;
+    remove-peer)  cmd_remove_peer "$@" ;;
+    list-peers)   cmd_list_peers "$@" ;;
+    export-key)   cmd_export_key "$@" ;;
+    reset)        cmd_reset "$@" ;;
+    -h|--help)    usage ;;
+    *)            echo "Unknown command: ${COMMAND}"; usage ;;
+esac

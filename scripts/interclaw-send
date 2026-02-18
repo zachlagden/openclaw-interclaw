@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+# interclaw-send — Send a PGP-signed (optionally encrypted) message
+# via the InterClaw protocol. Handles sequencing, state, and delivery.
+#
+# Usage:
+#   interclaw-send --to <email> --tag <TAG> --topic <topic> --body <text>
+#   interclaw-send --to "a@x.com,b@x.com" --tag MULTI --topic ops --body "..."
+#   interclaw-send --conv-id <ULID> --body "reply text"  # continue a thread
+#
+# Flags:
+#   --to          Recipient email(s), comma-separated for multi
+#   --tag         Message tag (COORD, ENCRYPTED, MULTI, etc.)
+#   --topic       Free-form topic string (becomes #topic in subject)
+#   --body        Message body text
+#   --conv-id     Continue an existing conversation (optional)
+#   --ref         ConvID:ConvSeq of message being replied to (optional)
+#   --subject     Custom subject description (optional)
+#   --encrypt     Force encryption even if tag doesn't require it
+#   --dry-run     Show what would be sent without sending
+#   --verbose     Show debug output
+
+set -euo pipefail
+
+# ── Resolve script directory and source library ───────────────────
+_self="${BASH_SOURCE[0]}"
+if command -v readlink &>/dev/null; then
+    _self="$(readlink -f "$_self" 2>/dev/null || readlink "$_self" 2>/dev/null || echo "$_self")"
+fi
+SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
+unset _self
+# shellcheck source=interclaw-lib
+source "${SCRIPT_DIR}/interclaw-lib"
+
+# ── Parse Arguments ───────────────────────────────────────────────
+TO=""
+TAG=""
+TOPIC=""
+BODY=""
+CONV_ID=""
+REF=""
+SUBJECT_DESC=""
+FORCE_ENCRYPT=false
+DRY_RUN=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --to)         TO="$2"; shift 2 ;;
+        --tag)        TAG="${2^^}"; shift 2 ;;
+        --topic)      TOPIC="$2"; shift 2 ;;
+        --body)       BODY="$2"; shift 2 ;;
+        --conv-id)    CONV_ID="$2"; shift 2 ;;
+        --ref)        REF="$2"; shift 2 ;;
+        --subject)    SUBJECT_DESC="$2"; shift 2 ;;
+        --encrypt)    FORCE_ENCRYPT=true; shift ;;
+        --dry-run)    DRY_RUN=true; shift ;;
+        --verbose)    export INTERCLAW_VERBOSE=true; shift ;;
+        -h|--help)
+            echo "Usage: interclaw-send --to <email> --tag <TAG> --topic <topic> --body <text>"
+            echo ""
+            echo "Flags:"
+            echo "  --to          Recipient email(s), comma-separated"
+            echo "  --tag         Message tag (COORD, ENCRYPTED, MULTI, etc.)"
+            echo "  --topic       Topic string"
+            echo "  --body        Message body"
+            echo "  --conv-id     Continue existing conversation"
+            echo "  --ref         Reply reference (ConvID:ConvSeq)"
+            echo "  --subject     Custom subject description"
+            echo "  --encrypt     Force encryption"
+            echo "  --dry-run     Preview without sending"
+            echo "  --verbose     Debug output"
+            exit 0
+            ;;
+        *)
+            die "Unknown argument: $1"
+            ;;
+    esac
+done
+
+# ── Validate Inputs ───────────────────────────────────────────────
+[[ -z "$TO" ]] && die "Missing --to"
+[[ -z "$TAG" ]] && die "Missing --tag"
+[[ -z "$BODY" ]] && die "Missing --body"
+
+validate_tag "$TAG" || die "Invalid tag: ${TAG}. Valid tags: ${VALID_TAGS}"
+
+# Validate each recipient email
+IFS=',' read -ra RECIPIENTS <<< "$TO"
+for email in "${RECIPIENTS[@]}"; do
+    email="${email## }"
+    email="${email%% }"
+    validate_email "$email" || die "Invalid email: ${email}"
+done
+
+# Multi-recipient requires MULTI tag
+if (( ${#RECIPIENTS[@]} > 1 )) && [[ "$TAG" != "MULTI" ]]; then
+    log WARN "Multiple recipients detected, switching tag to MULTI"
+    TAG="MULTI"
+fi
+
+# Topic defaults to "general"
+[[ -z "$TOPIC" ]] && TOPIC="general"
+
+# ── Initialize ────────────────────────────────────────────────────
+ensure_dirs
+check_dependencies
+load_config
+
+# Sanitize body
+BODY=$(sanitize_body "$BODY")
+
+# ── Determine Conversation ────────────────────────────────────────
+if [[ -n "$CONV_ID" ]]; then
+    # Continuing existing conversation
+    validate_conv_id "$CONV_ID" || die "Invalid ConvID: ${CONV_ID}"
+    if [[ ! -d "${INTERCLAW_CONV_DIR}/${CONV_ID}" ]]; then
+        die "Conversation ${CONV_ID} not found in state"
+    fi
+    log INFO "Continuing conversation ${CONV_ID}"
+else
+    # Create new conversation
+    local_participants=$(printf '%s' "${RECIPIENTS[*]}" | tr ' ' ',')
+    CONV_ID=$(create_conversation "$TOPIC" "$TAG" "$local_participants")
+    log INFO "New conversation: ${CONV_ID}"
+fi
+
+# ── Assign Sequence Numbers ──────────────────────────────────────
+GLOBAL_SEQ=$(next_global_seq)
+CONV_SEQ=$(next_conv_seq "$CONV_ID")
+
+# ── Build Reference ───────────────────────────────────────────────
+if [[ -z "$REF" ]]; then
+    # Check if this is the first message in the conversation
+    local_seq_num="${CONV_SEQ##0}"
+    local_seq_num="${local_seq_num:-0}"
+    if (( local_seq_num <= 1 )); then
+        REF="none"
+    else
+        # Default ref to previous message in this conversation
+        local prev_seq; prev_seq=$(printf "%03d" $(( 10#$CONV_SEQ - 1 )))
+        REF="${CONV_ID}:${prev_seq}"
+    fi
+fi
+
+# ── Build Subject Line ───────────────────────────────────────────
+if [[ -z "$SUBJECT_DESC" ]]; then
+    SUBJECT_DESC="${BODY:0:60}"
+    # Truncate at first newline
+    SUBJECT_DESC="${SUBJECT_DESC%%$'\n'*}"
+fi
+SUBJECT="[${TAG}] ${SUBJECT_DESC} #${TOPIC}"
+
+# ── Build Message Body with Headers ──────────────────────────────
+TIMESTAMP=$(now_utc)
+AGENT_ID="${INTERCLAW_AGENT_ID:-$(hostname)/1.0}"
+
+MESSAGE_BODY="GlobalSeq: ${GLOBAL_SEQ}
+ConvID:   ${CONV_ID}
+ConvSeq:  ${CONV_SEQ}
+Ref:      ${REF}
+Timestamp: ${TIMESTAMP}
+X-Agent-ID: ${AGENT_ID}"
+
+# Add shared secret if configured
+if [[ -n "${INTERCLAW_SHARED_SECRET:-}" ]]; then
+    MESSAGE_BODY="${MESSAGE_BODY}
+X-Agent-Secret: ${INTERCLAW_SHARED_SECRET}"
+fi
+
+# Add recipients header for multi-agent messages
+if (( ${#RECIPIENTS[@]} > 1 )); then
+    MESSAGE_BODY="${MESSAGE_BODY}
+Recipients: ${TO}"
+fi
+
+# Blank line separator then body content
+MESSAGE_BODY="${MESSAGE_BODY}
+
+${BODY}"
+
+# ── Determine Encryption ─────────────────────────────────────────
+SHOULD_ENCRYPT=false
+if [[ "$TAG" == "ENCRYPTED" ]] || [[ "$FORCE_ENCRYPT" == "true" ]]; then
+    SHOULD_ENCRYPT=true
+fi
+
+# ── PGP Sign (and optionally Encrypt) ────────────────────────────
+log INFO "Signing message ${GLOBAL_SEQ} (conv ${CONV_ID}:${CONV_SEQ})"
+
+if [[ "$SHOULD_ENCRYPT" == "true" ]]; then
+    log INFO "Encrypting message to ${#RECIPIENTS[@]} recipient(s)"
+    # Build trimmed recipient list for gpg
+    trimmed_recipients=()
+    for email in "${RECIPIENTS[@]}"; do
+        email="${email## }"
+        email="${email%% }"
+        trimmed_recipients+=("$email")
+    done
+    # Single gpg call with all recipients — each gets the session key
+    FINAL_BODY=$(pgp_sign_and_encrypt "$MESSAGE_BODY" "${trimmed_recipients[@]}") || \
+        die "Failed to sign+encrypt message. Are all recipient keys imported?"
+else
+    FINAL_BODY=$(pgp_sign "$MESSAGE_BODY") || \
+        die "Failed to PGP sign message. Check PGP_PRIVATE_KEY_ID."
+fi
+
+# ── Dry Run Check ────────────────────────────────────────────────
+if [[ "$DRY_RUN" == "true" ]]; then
+    echo "═══════════════════════════════════════"
+    echo "  DRY RUN — Message NOT sent"
+    echo "═══════════════════════════════════════"
+    echo ""
+    echo "To:       ${TO}"
+    echo "Subject:  ${SUBJECT}"
+    echo "GlobalSeq: ${GLOBAL_SEQ}"
+    echo "ConvID:   ${CONV_ID}"
+    echo "ConvSeq:  ${CONV_SEQ}"
+    echo "Ref:      ${REF}"
+    echo "Encrypted: ${SHOULD_ENCRYPT}"
+    echo ""
+    echo "--- Body ---"
+    echo "$FINAL_BODY"
+    echo "--- End ---"
+    exit 0
+fi
+
+# ── Send via Himalaya ─────────────────────────────────────────────
+log INFO "Sending ${GLOBAL_SEQ} to ${TO} via himalaya"
+
+SEND_RESULT=""
+SEND_OK=true
+
+for email in "${RECIPIENTS[@]}"; do
+    email="${email## }"
+    email="${email%% }"
+    log DEBUG "Delivering to ${email}"
+
+    result=$(himalaya_send "$email" "$SUBJECT" "$FINAL_BODY" 2>&1) || {
+        log ERROR "Failed to send to ${email}: ${result}"
+        SEND_OK=false
+        continue
+    }
+
+    log INFO "Delivered to ${email}"
+
+    # Track pending ACK (not for ACK/RECV/PING messages)
+    case "$TAG" in
+        ACK|RECV|PING|MISSING) ;;
+        *) add_pending_ack "$CONV_ID" "$CONV_SEQ" "$email" ;;
+    esac
+done
+
+# ── Archive Sent Message ─────────────────────────────────────────
+archive_sent_message "$GLOBAL_SEQ" "$CONV_ID" "$CONV_SEQ" "$MESSAGE_BODY" "$TAG"
+
+# ── Update threads.json ──────────────────────────────────────────
+generate_threads_json
+
+# ── Output ────────────────────────────────────────────────────────
+if [[ "$SEND_OK" == "true" ]]; then
+    echo "Sent ${GLOBAL_SEQ} [${TAG}] → ${TO} (${CONV_ID}:${CONV_SEQ})"
+    log INFO "Send complete: ${GLOBAL_SEQ} [${TAG}] → ${TO} (${CONV_ID}:${CONV_SEQ})"
+else
+    echo "PARTIAL FAILURE: Some recipients failed. Check logs." >&2
+    log ERROR "Partial send failure for ${GLOBAL_SEQ}"
+    exit 1
+fi

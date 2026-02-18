@@ -1,0 +1,447 @@
+#!/usr/bin/env bash
+# interclaw-handshake — Full PGP key exchange with a peer agent.
+#
+# Performs the InterClaw v3 handshake sequence:
+#   1. Export your public key
+#   2. Send [HANDSHAKE] message with your key to peer
+#   3. Wait for peer's [HANDSHAKE] response with their key
+#   4. Import peer's key and verify fingerprint
+#   5. Send encrypted test message to confirm channel
+#   6. Wait for [ACK] confirmation
+#
+# RETRY SUPPORT:
+#   If the peer doesn't respond within --timeout, the handshake is queued
+#   in ~/.interclaw/state/pending_handshakes/ for automatic retry.
+#   When interclaw-receive processes an incoming [HANDSHAKE], it checks
+#   the pending queue and auto-completes matching handshakes.
+#
+# Usage:
+#   interclaw-handshake --peer <email>
+#   interclaw-handshake --peer <email> --fingerprint <expected-fp>
+#   interclaw-handshake --peer <email> --max-retries 5 --retry-delay 300
+#   interclaw-handshake --accept <email>
+#   interclaw-handshake --retry-pending
+#   interclaw-handshake --list-pending
+#
+# Flags:
+#   --peer           Peer email address to handshake with
+#   --fingerprint    Expected fingerprint for verification (optional)
+#   --accept         Accept an incoming handshake (respond with our key)
+#   --timeout        Timeout in seconds to wait for response (default: 300)
+#   --max-retries    Maximum retry attempts on timeout (default: 3)
+#   --retry-delay    Seconds between retries (default: 300)
+#   --retry-pending  Process all pending handshakes that are due for retry
+#   --list-pending   List all pending handshakes and their status
+#   --verbose        Debug output
+
+set -euo pipefail
+
+# ── Resolve script directory and source library ───────────────────
+_self="${BASH_SOURCE[0]}"
+if command -v readlink &>/dev/null; then
+    _self="$(readlink -f "$_self" 2>/dev/null || readlink "$_self" 2>/dev/null || echo "$_self")"
+fi
+SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
+unset _self
+# shellcheck source=interclaw-lib
+source "${SCRIPT_DIR}/interclaw-lib"
+
+# ── Parse Arguments ───────────────────────────────────────────────
+PEER=""
+EXPECTED_FP=""
+ACCEPT_MODE=false
+RETRY_PENDING_MODE=false
+LIST_PENDING_MODE=false
+TIMEOUT=300
+MAX_RETRIES=3
+RETRY_DELAY=300
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --peer)           PEER="$2"; shift 2 ;;
+        --fingerprint)    EXPECTED_FP="$2"; shift 2 ;;
+        --accept)         ACCEPT_MODE=true; PEER="$2"; shift 2 ;;
+        --timeout)        TIMEOUT="$2"; shift 2 ;;
+        --max-retries)    MAX_RETRIES="$2"; shift 2 ;;
+        --retry-delay)    RETRY_DELAY="$2"; shift 2 ;;
+        --retry-pending)  RETRY_PENDING_MODE=true; shift ;;
+        --list-pending)   LIST_PENDING_MODE=true; shift ;;
+        --verbose)        export INTERCLAW_VERBOSE=true; shift ;;
+        -h|--help)
+            echo "Usage: interclaw-handshake --peer <email> [options]"
+            echo "       interclaw-handshake --accept <email>"
+            echo "       interclaw-handshake --retry-pending"
+            echo "       interclaw-handshake --list-pending"
+            echo ""
+            echo "Initiate or accept a PGP key exchange with a peer agent."
+            echo ""
+            echo "Flags:"
+            echo "  --peer           Peer email to exchange keys with"
+            echo "  --fingerprint    Expected fingerprint for verification"
+            echo "  --accept         Respond to an incoming handshake"
+            echo "  --timeout        Wait timeout in seconds (default: 300)"
+            echo "  --max-retries    Max retry attempts on timeout (default: 3)"
+            echo "  --retry-delay    Seconds between retries (default: 300)"
+            echo "  --retry-pending  Retry all due pending handshakes"
+            echo "  --list-pending   List pending handshakes"
+            echo "  --verbose        Debug output"
+            exit 0
+            ;;
+        *)
+            die "Unknown argument: $1"
+            ;;
+    esac
+done
+
+# ── Initialize ────────────────────────────────────────────────────
+ensure_dirs
+check_dependencies
+load_config
+
+AGENT_ID="${INTERCLAW_AGENT_ID:-$(hostname)/1.0}"
+
+# ══════════════════════════════════════════════════════════════════
+# MODE: --list-pending
+# ══════════════════════════════════════════════════════════════════
+
+if [[ "$LIST_PENDING_MODE" == "true" ]]; then
+    echo "Pending Handshakes"
+    echo "══════════════════════════════════════════════════════"
+
+    local_count=0
+    while IFS='|' read -r peer retries next_retry initiated; do
+        [[ -z "$peer" ]] && continue
+        local_count=$(( local_count + 1 ))
+
+        local now_epoch; now_epoch=$(date +%s)
+        local status="waiting"
+        if (( next_retry <= now_epoch )); then
+            status="READY to retry"
+        fi
+        if (( retries <= 0 )); then
+            status="EXHAUSTED"
+        fi
+
+        printf "  %-35s retries=%-2s  status=%-16s  initiated=%s\n" \
+            "$peer" "$retries" "$status" "$initiated"
+    done <<< "$(list_pending_handshakes)"
+
+    if (( local_count == 0 )); then
+        echo "  No pending handshakes."
+    fi
+    echo ""
+    exit 0
+fi
+
+# ══════════════════════════════════════════════════════════════════
+# MODE: --retry-pending
+# ══════════════════════════════════════════════════════════════════
+
+if [[ "$RETRY_PENDING_MODE" == "true" ]]; then
+    echo "Processing pending handshakes..."
+    echo ""
+
+    local_now=$(date +%s)
+    local_retried=0
+    local_exhausted=0
+
+    while IFS='|' read -r peer retries next_retry initiated; do
+        [[ -z "$peer" ]] && continue
+
+        # Skip if not yet due
+        if (( next_retry > local_now )); then
+            log DEBUG "Handshake with ${peer} not yet due (next retry at ${next_retry})"
+            continue
+        fi
+
+        # Skip if exhausted
+        if (( retries <= 0 )); then
+            echo "  ${peer}: retries exhausted — removing from queue"
+            remove_pending_handshake "$peer"
+            local_exhausted=$(( local_exhausted + 1 ))
+            continue
+        fi
+
+        # Check if peer's key appeared since last attempt
+        local peer_fp
+        peer_fp=$(pgp_get_fingerprint "$peer" 2>/dev/null || echo "")
+        if [[ -n "$peer_fp" ]]; then
+            echo "  ${peer}: key found (${peer_fp}) — handshake complete!"
+            add_trusted_fingerprint "$peer_fp"
+            remove_pending_handshake "$peer"
+            continue
+        fi
+
+        # Retry: re-send our handshake message
+        echo "  ${peer}: retrying (${retries} attempts remaining)..."
+
+        local our_pubkey
+        our_pubkey=$(pgp_export_pubkey) || {
+            log ERROR "Failed to export public key for retry"
+            continue
+        }
+        local our_fp
+        our_fp=$(pgp_get_fingerprint "${PGP_PRIVATE_KEY_ID}")
+
+        local handshake_body="InterClaw Handshake from ${AGENT_ID}
+Agent-Email: ${INTERCLAW_EMAIL}
+Fingerprint: ${our_fp}
+
+${our_pubkey}"
+
+        "${SCRIPT_DIR}/interclaw-send" \
+            --to "$peer" \
+            --tag HANDSHAKE \
+            --topic handshake \
+            --subject "Hello (retry) — key exchange from ${AGENT_ID}" \
+            --body "$handshake_body" 2>/dev/null || {
+                log ERROR "Failed to send retry handshake to ${peer}"
+                continue
+            }
+
+        decrement_handshake_retry "$peer"
+        local_retried=$(( local_retried + 1 ))
+        echo "    Sent. Next retry in ${RETRY_DELAY}s."
+
+    done <<< "$(list_pending_handshakes)"
+
+    echo ""
+    echo "Done. Retried: ${local_retried}, Exhausted: ${local_exhausted}"
+    exit 0
+fi
+
+# ══════════════════════════════════════════════════════════════════
+# Validate peer for initiate/accept modes
+# ══════════════════════════════════════════════════════════════════
+
+[[ -z "$PEER" ]] && die "Missing --peer or --accept <email>"
+validate_email "$PEER" || die "Invalid peer email: ${PEER}"
+
+echo "══════════════════════════════════════════"
+echo "  InterClaw Handshake"
+echo "══════════════════════════════════════════"
+echo ""
+echo "  Agent:  ${AGENT_ID}"
+echo "  Email:  ${INTERCLAW_EMAIL}"
+echo "  Peer:   ${PEER}"
+echo ""
+
+# ── Export our public key ─────────────────────────────────────────
+echo "Exporting public key..."
+OUR_PUBKEY=$(pgp_export_pubkey) || die "Failed to export public key. Check PGP_PRIVATE_KEY_ID."
+
+if [[ -z "$OUR_PUBKEY" ]]; then
+    die "Public key export returned empty. Verify PGP_PRIVATE_KEY_ID=${PGP_PRIVATE_KEY_ID}"
+fi
+
+OUR_FINGERPRINT=$(pgp_get_fingerprint "${PGP_PRIVATE_KEY_ID}")
+echo "  Our fingerprint: ${OUR_FINGERPRINT}"
+echo ""
+
+# ── Build handshake message body ──────────────────────────────────
+HANDSHAKE_BODY="InterClaw Handshake from ${AGENT_ID}
+Agent-Email: ${INTERCLAW_EMAIL}
+Fingerprint: ${OUR_FINGERPRINT}
+
+${OUR_PUBKEY}"
+
+# ══════════════════════════════════════════════════════════════════
+# MODE: --accept (respond to incoming handshake)
+# ══════════════════════════════════════════════════════════════════
+
+if [[ "$ACCEPT_MODE" == "true" ]]; then
+    echo "Accepting handshake — sending our key to ${PEER}..."
+
+    "${SCRIPT_DIR}/interclaw-send" \
+        --to "$PEER" \
+        --tag HANDSHAKE \
+        --topic handshake \
+        --subject "Welcome — key exchange from ${AGENT_ID}" \
+        --body "$HANDSHAKE_BODY" || die "Failed to send handshake response"
+
+    echo ""
+    echo "Handshake response sent to ${PEER}."
+    echo "Waiting for encrypted test message..."
+    echo ""
+
+    echo "Polling for test message (timeout: ${TIMEOUT}s)..."
+    ELAPSED=0
+    STEP=10
+    TEST_RECEIVED=false
+
+    while (( ELAPSED < TIMEOUT )); do
+        "${SCRIPT_DIR}/interclaw-receive" --once 2>/dev/null || true
+
+        for conv in "${INTERCLAW_CONV_DIR}"/*/; do
+            [[ -d "$conv" ]] || continue
+            local_parts=$(grep "^participants=" "${conv}/meta" 2>/dev/null | cut -d= -f2- || true)
+            if [[ "$local_parts" == *"$PEER"* ]]; then
+                local_tag=$(grep "^tag=" "${conv}/meta" 2>/dev/null | cut -d= -f2- || true)
+                if [[ "$local_tag" == "ENCRYPTED" ]]; then
+                    TEST_RECEIVED=true
+                    break 2
+                fi
+            fi
+        done
+
+        sleep "$STEP"
+        ELAPSED=$(( ELAPSED + STEP ))
+        echo "  ...waiting (${ELAPSED}/${TIMEOUT}s)"
+    done
+
+    if [[ "$TEST_RECEIVED" == "true" ]]; then
+        echo ""
+        echo "Encrypted test received and verified!"
+
+        # Step 4/4 per protocol: send ACK to confirm the channel is live
+        echo "Sending handshake ACK to ${PEER}..."
+        "${SCRIPT_DIR}/interclaw-send" \
+            --to "$PEER" \
+            --tag ACK \
+            --topic handshake \
+            --subject "Handshake ACK — ${AGENT_ID}" \
+            --body "Handshake complete. Channel verified." \
+            2>/dev/null || log WARN "Failed to send handshake ACK to ${PEER}"
+
+        echo "Handshake COMPLETE. Channel is secure."
+    else
+        echo ""
+        echo "Timeout waiting for encrypted test message."
+        echo "Handshake INCOMPLETE. Peer may still complete later."
+    fi
+
+    log INFO "Handshake accept with ${PEER} completed (test_received=${TEST_RECEIVED})"
+    exit 0
+fi
+
+# ══════════════════════════════════════════════════════════════════
+# MODE: --peer (initiate new handshake)
+# ══════════════════════════════════════════════════════════════════
+
+echo "Step 1/4: Sending our public key to ${PEER}..."
+
+"${SCRIPT_DIR}/interclaw-send" \
+    --to "$PEER" \
+    --tag HANDSHAKE \
+    --topic handshake \
+    --subject "Hello — key exchange from ${AGENT_ID}" \
+    --body "$HANDSHAKE_BODY" || die "Failed to send handshake"
+
+echo "  Sent."
+echo ""
+
+# ── Wait for peer's handshake response ────────────────────────────
+echo "Step 2/4: Waiting for ${PEER}'s key (timeout: ${TIMEOUT}s)..."
+
+ELAPSED=0
+STEP=10
+PEER_KEY_RECEIVED=false
+PEER_FINGERPRINT=""
+
+while (( ELAPSED < TIMEOUT )); do
+    "${SCRIPT_DIR}/interclaw-receive" --once 2>/dev/null || true
+
+    PEER_FINGERPRINT=$(pgp_get_fingerprint "$PEER" 2>/dev/null || echo "")
+
+    if [[ -n "$PEER_FINGERPRINT" ]]; then
+        PEER_KEY_RECEIVED=true
+        break
+    fi
+
+    sleep "$STEP"
+    ELAPSED=$(( ELAPSED + STEP ))
+    echo "  ...waiting (${ELAPSED}/${TIMEOUT}s)"
+done
+
+if [[ "$PEER_KEY_RECEIVED" != "true" ]]; then
+    echo ""
+    echo "Timeout waiting for peer's key."
+
+    # ── Queue for retry ───────────────────────────────────────────
+    if (( MAX_RETRIES > 0 )); then
+        save_pending_handshake "$PEER" "$MAX_RETRIES" "$RETRY_DELAY" "$EXPECTED_FP"
+        echo ""
+        echo "Handshake QUEUED for automatic retry."
+        echo "  Retries remaining: ${MAX_RETRIES}"
+        echo "  Retry interval:    ${RETRY_DELAY}s"
+        echo ""
+        echo "Retries happen when you run:"
+        echo "  interclaw-handshake --retry-pending"
+        echo ""
+        echo "Or add to cron:"
+        echo "  */5 * * * * interclaw-handshake --retry-pending"
+        echo ""
+        echo "The peer can also trigger completion by running:"
+        echo "  interclaw-handshake --accept ${INTERCLAW_EMAIL}"
+    else
+        echo "No retries configured. The peer needs to run:"
+        echo "  interclaw-handshake --accept ${INTERCLAW_EMAIL}"
+    fi
+    echo ""
+    log WARN "Handshake timeout with ${PEER}, queued for retry (max=${MAX_RETRIES})"
+    exit 1
+fi
+
+echo "  Received peer key. Fingerprint: ${PEER_FINGERPRINT}"
+echo ""
+
+# ── Fingerprint verification ─────────────────────────────────────
+if [[ -n "$EXPECTED_FP" ]]; then
+    if [[ "$PEER_FINGERPRINT" != "$EXPECTED_FP" ]]; then
+        echo "FINGERPRINT MISMATCH!"
+        echo "  Expected: ${EXPECTED_FP}"
+        echo "  Got:      ${PEER_FINGERPRINT}"
+        echo ""
+        die "Fingerprint mismatch — aborting handshake. Possible MITM."
+    fi
+    echo "  Fingerprint matches expected value."
+else
+    echo "  WARNING: No expected fingerprint provided."
+    echo "  Peer fingerprint: ${PEER_FINGERPRINT}"
+    echo "  Verify this out-of-band before trusting."
+fi
+echo ""
+
+# ── Add peer to trusted list ─────────────────────────────────────
+echo "Step 3/4: Adding ${PEER} to trusted peers..."
+add_trusted_fingerprint "$PEER_FINGERPRINT"
+
+# Remove from pending queue if it was there
+remove_pending_handshake "$PEER" 2>/dev/null || true
+
+echo "  Trusted."
+echo ""
+
+# ── Send encrypted test message ───────────────────────────────────
+echo "Step 4/4: Sending encrypted test message..."
+
+TEST_BODY="handshake-complete
+Peer: ${PEER}
+Fingerprint: ${PEER_FINGERPRINT}
+Initiated-By: ${AGENT_ID}
+Timestamp: $(now_utc)"
+
+"${SCRIPT_DIR}/interclaw-send" \
+    --to "$PEER" \
+    --tag ENCRYPTED \
+    --topic handshake \
+    --subject "Handshake test — ${AGENT_ID}" \
+    --body "$TEST_BODY" \
+    --encrypt || die "Failed to send encrypted test message"
+
+echo "  Encrypted test sent."
+echo ""
+
+echo "══════════════════════════════════════════"
+echo "  Handshake COMPLETE"
+echo "══════════════════════════════════════════"
+echo ""
+echo "  Peer:        ${PEER}"
+echo "  Fingerprint: ${PEER_FINGERPRINT}"
+echo "  Status:      TRUSTED"
+echo ""
+echo "  You can now send messages with:"
+echo "  interclaw-send --to ${PEER} --tag COORD --topic test --body \"Hello!\""
+echo ""
+
+log INFO "Handshake complete with ${PEER} (${PEER_FINGERPRINT})"

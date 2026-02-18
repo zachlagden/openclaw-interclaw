@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+# interclaw-status — Display a formatted overview of all InterClaw state:
+# conversations, pending ACKs, detected gaps, and peer status.
+#
+# Usage:
+#   interclaw-status              # Full status overview
+#   interclaw-status --json       # Output as JSON (threads.json)
+#   interclaw-status --brief      # One-line summary
+#   interclaw-status --conv <ID>  # Detail for one conversation
+
+set -euo pipefail
+
+# ── Resolve script directory and source library ───────────────────
+_self="${BASH_SOURCE[0]}"
+if command -v readlink &>/dev/null; then
+    _self="$(readlink -f "$_self" 2>/dev/null || readlink "$_self" 2>/dev/null || echo "$_self")"
+fi
+SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
+unset _self
+# shellcheck source=interclaw-lib
+source "${SCRIPT_DIR}/interclaw-lib"
+
+# ── Parse Arguments ───────────────────────────────────────────────
+OUTPUT_MODE="table"
+CONV_FILTER=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --json)    OUTPUT_MODE="json"; shift ;;
+        --brief)   OUTPUT_MODE="brief"; shift ;;
+        --conv)    CONV_FILTER="$2"; shift 2 ;;
+        --verbose) export INTERCLAW_VERBOSE=true; shift ;;
+        -h|--help)
+            echo "Usage: interclaw-status [--json|--brief|--conv <ConvID>]"
+            echo ""
+            echo "Modes:"
+            echo "  (default)   Formatted table overview"
+            echo "  --json      Output threads.json"
+            echo "  --brief     One-line summary"
+            echo "  --conv ID   Detail for one conversation"
+            exit 0
+            ;;
+        *)
+            die "Unknown argument: $1"
+            ;;
+    esac
+done
+
+# ── Initialize ────────────────────────────────────────────────────
+ensure_dirs
+
+# Load config if available (non-fatal for status)
+if [[ -f "${INTERCLAW_CONFIG}" ]]; then
+    load_config 2>/dev/null || true
+fi
+
+AGENT_ID="${INTERCLAW_AGENT_ID:-$(hostname)/1.0}"
+
+# ── JSON Mode ─────────────────────────────────────────────────────
+if [[ "$OUTPUT_MODE" == "json" ]]; then
+    generate_threads_json
+    cat "${INTERCLAW_THREADS_JSON}"
+    exit 0
+fi
+
+# ── Gather Data ───────────────────────────────────────────────────
+GLOBAL_SEQ=$(cat "${INTERCLAW_GLOBAL_SEQ_FILE}" 2>/dev/null || echo "0")
+
+# Count conversations
+CONV_COUNT=0
+ACTIVE_CONVS=()
+while IFS='|' read -r conv_id topic tag participants seq created activity; do
+    [[ -z "$conv_id" ]] && continue
+    ACTIVE_CONVS+=("${conv_id}|${topic}|${tag}|${participants}|${seq}|${created}|${activity}")
+    CONV_COUNT=$(( CONV_COUNT + 1 ))
+done <<< "$(list_conversations)"
+
+# Count pending ACKs
+ACK_COUNT=0
+PENDING_ACKS=()
+while IFS='|' read -r key recipient sent_at; do
+    [[ -z "$key" ]] && continue
+    PENDING_ACKS+=("${key}|${recipient}|${sent_at}")
+    ACK_COUNT=$(( ACK_COUNT + 1 ))
+done <<< "$(list_pending_acks)"
+
+# Count trusted peers
+PEER_COUNT=0
+if [[ -d "${INTERCLAW_KEYS_DIR}" ]]; then
+    PEER_COUNT=$(find "${INTERCLAW_KEYS_DIR}" -name "*.asc" 2>/dev/null | wc -l)
+fi
+
+# ── Brief Mode ────────────────────────────────────────────────────
+if [[ "$OUTPUT_MODE" == "brief" ]]; then
+    echo "InterClaw ${AGENT_ID} | GlobalSeq: D-$(printf '%03d' "$GLOBAL_SEQ") | Conversations: ${CONV_COUNT} | Pending ACKs: ${ACK_COUNT} | Peers: ${PEER_COUNT}"
+    exit 0
+fi
+
+# ── Single Conversation Detail ────────────────────────────────────
+if [[ -n "$CONV_FILTER" ]]; then
+    conv_dir="${INTERCLAW_CONV_DIR}/${CONV_FILTER}"
+    if [[ ! -d "$conv_dir" ]]; then
+        die "Conversation ${CONV_FILTER} not found"
+    fi
+
+    topic=$(get_conv_meta "$CONV_FILTER" "topic")
+    tag=$(get_conv_meta "$CONV_FILTER" "tag")
+    participants=$(get_conv_meta "$CONV_FILTER" "participants")
+    created=$(get_conv_meta "$CONV_FILTER" "created_at")
+    activity=$(get_conv_meta "$CONV_FILTER" "last_activity")
+    seq=$(get_conv_seq "$CONV_FILTER")
+
+    echo "══════════════════════════════════════════════════════"
+    echo "  Conversation Detail"
+    echo "══════════════════════════════════════════════════════"
+    echo ""
+    echo "  ConvID:        ${CONV_FILTER}"
+    echo "  Topic:         ${topic}"
+    echo "  Tag:           [${tag}]"
+    echo "  Participants:  ${participants}"
+    echo "  ConvSeq:       ${seq}"
+    echo "  Created:       ${created}"
+    echo "  Last Activity: ${activity}"
+    echo ""
+
+    # List sent messages
+    sent_dir="${conv_dir}/sent"
+    if [[ -d "$sent_dir" ]] && ls "$sent_dir"/*.msg &>/dev/null; then
+        echo "  Sent Messages:"
+        for msg in "$sent_dir"/*.msg; do
+            local_seq=$(basename "$msg" .msg)
+            echo "    [${local_seq}] $(head -1 "$msg" 2>/dev/null)"
+        done
+        echo ""
+    fi
+
+    # List received messages
+    recv_dir="${conv_dir}/received"
+    if [[ -d "$recv_dir" ]] && ls "$recv_dir"/*.msg &>/dev/null; then
+        echo "  Received Messages:"
+        for msg in "$recv_dir"/*.msg; do
+            local_seq=$(basename "$msg" .msg)
+            sender=$(grep "^sender=" "$msg" 2>/dev/null | head -1 | cut -d= -f2-)
+            ts=$(grep "^received_at=" "$msg" 2>/dev/null | head -1 | cut -d= -f2-)
+            echo "    [${local_seq}] from ${sender:-unknown} at ${ts:-unknown}"
+        done
+        echo ""
+    fi
+
+    # Check for gaps in received messages
+    if [[ -d "$recv_dir" ]]; then
+        highest=$(ls "$recv_dir" 2>/dev/null | sed 's/\.msg$//' | sort -n | tail -1)
+        if [[ -n "$highest" ]]; then
+            gaps=""
+            for (( i=1; i<=10#$highest; i++ )); do
+                padded=$(printf "%03d" "$i")
+                if [[ ! -f "${recv_dir}/${padded}.msg" ]]; then
+                    gaps="${gaps} ${padded}"
+                fi
+            done
+            if [[ -n "$gaps" ]]; then
+                echo "  GAPS DETECTED:${gaps}"
+                echo ""
+            fi
+        fi
+    fi
+
+    # Pending ACKs for this conversation
+    local_acks=""
+    for ack_entry in "${PENDING_ACKS[@]}"; do
+        local_key="${ack_entry%%|*}"
+        if [[ "$local_key" == "${CONV_FILTER}:"* ]]; then
+            local_acks="${local_acks}    ${ack_entry}\n"
+        fi
+    done
+    if [[ -n "$local_acks" ]]; then
+        echo "  Pending ACKs:"
+        echo -e "$local_acks"
+    fi
+
+    exit 0
+fi
+
+# ── Full Table View ───────────────────────────────────────────────
+echo ""
+echo "══════════════════════════════════════════════════════════════════════"
+echo "  InterClaw Status — ${AGENT_ID}"
+echo "══════════════════════════════════════════════════════════════════════"
+echo ""
+echo "  Global Sequence:  D-$(printf '%03d' "$GLOBAL_SEQ")"
+echo "  Conversations:    ${CONV_COUNT}"
+echo "  Pending ACKs:     ${ACK_COUNT}"
+echo "  Trusted Peers:    ${PEER_COUNT}"
+echo ""
+
+# ── Conversations Table ───────────────────────────────────────────
+if (( CONV_COUNT > 0 )); then
+    echo "  Conversations"
+    echo "  ──────────────────────────────────────────────────────────────────"
+    printf "  %-28s %-8s %-12s %-28s %s\n" "ConvID" "Tag" "Seq" "Participants" "Topic"
+    echo "  ──────────────────────────────────────────────────────────────────"
+
+    for entry in "${ACTIVE_CONVS[@]}"; do
+        IFS='|' read -r conv_id topic tag participants seq created activity <<< "$entry"
+        # Truncate long fields
+        disp_parts="${participants}"
+        if (( ${#disp_parts} > 26 )); then
+            disp_parts="${disp_parts:0:23}..."
+        fi
+        disp_topic="${topic}"
+        if (( ${#disp_topic} > 15 )); then
+            disp_topic="${disp_topic:0:12}..."
+        fi
+        printf "  %-28s [%-6s] %-12s %-28s %s\n" \
+            "${conv_id:0:26}" "$tag" "$seq" "$disp_parts" "$disp_topic"
+    done
+    echo ""
+else
+    echo "  No active conversations."
+    echo ""
+fi
+
+# ── Pending ACKs Table ────────────────────────────────────────────
+if (( ACK_COUNT > 0 )); then
+    echo "  Pending ACKs"
+    echo "  ──────────────────────────────────────────────────────────────────"
+    printf "  %-36s %-30s %s\n" "Reference" "Recipient" "Sent"
+    echo "  ──────────────────────────────────────────────────────────────────"
+
+    for entry in "${PENDING_ACKS[@]}"; do
+        IFS='|' read -r key recipient sent_at <<< "$entry"
+        printf "  %-36s %-30s %s\n" "$key" "$recipient" "$sent_at"
+    done
+    echo ""
+else
+    echo "  No pending ACKs."
+    echo ""
+fi
+
+# ── Gap Detection ─────────────────────────────────────────────────
+TOTAL_GAPS=0
+GAP_REPORT=""
+
+for entry in "${ACTIVE_CONVS[@]}"; do
+    IFS='|' read -r conv_id _ _ _ _ _ _ <<< "$entry"
+    recv_dir="${INTERCLAW_CONV_DIR}/${conv_id}/received"
+    if [[ ! -d "$recv_dir" ]]; then
+        continue
+    fi
+
+    highest=$(ls "$recv_dir" 2>/dev/null | sed 's/\.msg$//' | sort -n | tail -1)
+    [[ -z "$highest" ]] && continue
+
+    gaps=""
+    for (( i=1; i<=10#$highest; i++ )); do
+        padded=$(printf "%03d" "$i")
+        if [[ ! -f "${recv_dir}/${padded}.msg" ]]; then
+            gaps="${gaps}${padded} "
+            TOTAL_GAPS=$(( TOTAL_GAPS + 1 ))
+        fi
+    done
+
+    if [[ -n "$gaps" ]]; then
+        GAP_REPORT="${GAP_REPORT}  ${conv_id:0:26}  missing: ${gaps}\n"
+    fi
+done
+
+if (( TOTAL_GAPS > 0 )); then
+    echo "  Sequence Gaps (${TOTAL_GAPS} missing)"
+    echo "  ──────────────────────────────────────────────────────────────────"
+    echo -e "$GAP_REPORT"
+else
+    echo "  No sequence gaps detected."
+    echo ""
+fi
+
+# ── Trusted Peers ────────────────────────────────────────────────
+if (( PEER_COUNT > 0 )); then
+    echo "  Trusted Peers"
+    echo "  ──────────────────────────────────────────────────────────────────"
+    for keyfile in "${INTERCLAW_KEYS_DIR}"/*.asc; do
+        [[ -f "$keyfile" ]] || continue
+        fp=$(basename "$keyfile" .asc)
+        # Try to get the UID for this key
+        uid=$(gpg --batch --with-colons --list-keys "$fp" 2>/dev/null | grep "^uid:" | head -1 | cut -d: -f10 || echo "unknown")
+        printf "  %-44s %s\n" "$fp" "$uid"
+    done
+    echo ""
+fi
+
+echo "══════════════════════════════════════════════════════════════════════"
+echo ""
