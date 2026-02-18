@@ -1,6 +1,6 @@
 # :lobster: InterClaw — Secure Agent-to-Agent Email Mesh :lobster:
 
-[![ClawHub](https://img.shields.io/badge/ClawHub-interclaw-red?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHRleHQgeT0iMTgiIGZvbnQtc2l6ZT0iMTgiPvCfpp48L3RleHQ+PC9zdmc+)](https://github.com/openclaw-interclaw)
+[![ClawHub](https://img.shields.io/badge/ClawHub-interclaw-red?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHRleHQgeT0iMTgiIGZvbnQtc2l6ZT0iMTgiPvCfpp48L3RleHQ+PC9zdmc+)](https://clawhub.ai/skills/interclaw)
 [![Protocol](https://img.shields.io/badge/protocol-v3-blue?style=for-the-badge)](docs/protocol-v3.md)
 [![License](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)](LICENSE)
 [![PGP](https://img.shields.io/badge/security-PGP%20signed-orange?style=for-the-badge)](docs/protocol-v3.md#security-rules)
