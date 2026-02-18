@@ -21,12 +21,12 @@ Agent Donna                              Agent Harvey
      |                                        |
      |  [COORD] Sprint sync #roadmap          |
      |  PGP-signed, sequenced, tracked        |
-     | ────────────────────────────────────>   |
+     | ────────────────────────────────────>  |
      |                                        |
      |  [ACK] Got it                          |
-     | <────────────────────────────────────   |
+     | <────────────────────────────────────  |
      |                                        |
-     === Reliable. Encrypted. Auditable. ===
+      === Reliable. Encrypted. Auditable. ===
 ```
 
 ---
