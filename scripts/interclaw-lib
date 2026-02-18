@@ -711,9 +711,10 @@ himalaya_send() {
     local to="$1"
     local subject="$2"
     local body="$3"
+    local from="${INTERCLAW_EMAIL:-}"
 
     # himalaya message send expects a raw RFC 822 message on stdin
-    printf 'To: %s\r\nSubject: %s\r\n\r\n%s' "$to" "$subject" "$body" \
+    printf 'From: %s\r\nTo: %s\r\nSubject: %s\r\n\r\n%s' "$from" "$to" "$subject" "$body" \
         | himalaya message send 2>&1
 }
 
